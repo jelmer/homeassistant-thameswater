@@ -11,7 +11,7 @@ test = [
     # The integration's own requirement, which `manifest.json` states for
     # Home Assistant to install at runtime and nothing installs for a test
     # run.
-    "thameswaterapi>=0.5.0",
+    "thameswaterapi>=0.6.0",
 ]
 
 [tool.pytest.ini_options]
