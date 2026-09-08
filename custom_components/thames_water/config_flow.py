@@ -1,11 +1,15 @@
 """Config flow for Thames Water integration."""
 
+import logging
+
 import voluptuous as vol
 
 from homeassistant import config_entries
 
 from .const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
 from thameswaterapi import AuthenticationError, ThamesWater
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -17,6 +21,7 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialise the config flow."""
         self._credentials: dict = {}
         self._client: ThamesWater | None = None
+        self._error: str | None = None
 
     async def async_step_user(self, user_input=None):
         """Handle the initial step: collect credentials."""
@@ -30,8 +35,10 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     user_input["password"],
                 )
             except AuthenticationError:
+                _LOGGER.exception("Thames Water rejected the sign-in")
                 errors["base"] = "invalid_auth"
             except Exception:
+                _LOGGER.exception("Could not sign in to Thames Water")
                 errors["base"] = "cannot_connect"
             else:
                 return await self.async_step_account()
@@ -53,9 +60,11 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle the account selection step."""
         assert self._client is not None
 
-        account_numbers = await self.hass.async_add_executor_job(
-            self._client.get_account_numbers
+        ok, account_numbers = await self._fetch(
+            self._client.get_account_numbers, "list the accounts"
         )
+        if not ok:
+            return self._abort_reason()
         # A login with one account, or none listed at all, has nothing to
         # choose between, and the client already holds the account its own
         # token names as the default.
@@ -70,7 +79,9 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # `get_account` names the account in a header taken from
         # `account_number`, so it answers for whichever one is set.
-        account = await self.hass.async_add_executor_job(self._client.get_account)
+        ok, account = await self._fetch(self._client.get_account, "load the account")
+        if not ok:
+            return self._abort_reason()
         if not account.is_smart_metered:
             if not choosing:
                 return self.async_abort(reason="not_smart_metered")
@@ -111,9 +122,11 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 },
             )
 
-        meter_numbers = await self.hass.async_add_executor_job(
-            self._client.get_meter_numbers
+        ok, meter_numbers = await self._fetch(
+            self._client.get_meter_numbers, "list the meters"
         )
+        if not ok:
+            return self._abort_reason()
         if not meter_numbers:
             errors["base"] = "no_meters"
             return self.async_show_form(
@@ -133,6 +146,34 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="meter", data_schema=data_schema, errors=errors
         )
+
+    async def _fetch(self, call, description: str):
+        """Run a blocking client call, reporting whether it succeeded.
+
+        `thameswaterapi` talks over `requests`, so every call belongs in an
+        executor. A failure past the credentials form has no form to report
+        against, and letting it escape leaves the user with nothing but an
+        unexplained error, so the reason is kept for `_abort_reason`.
+
+        Success is reported separately from the result, because an empty list
+        is an answer these calls do give.
+        """
+        try:
+            return True, await self.hass.async_add_executor_job(call)
+        except AuthenticationError:
+            _LOGGER.exception(
+                "Thames Water rejected the session trying to %s", description
+            )
+            self._error = "invalid_auth"
+        except Exception:
+            _LOGGER.exception("Could not %s from Thames Water", description)
+            self._error = "cannot_connect"
+        return False, None
+
+    def _abort_reason(self):
+        """End the flow with the reason `_fetch` last recorded."""
+        assert self._error is not None
+        return self.async_abort(reason=self._error)
 
     @staticmethod
     def _authenticate(username: str, password: str) -> ThamesWater:
