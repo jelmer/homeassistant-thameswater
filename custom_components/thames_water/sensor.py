@@ -188,6 +188,7 @@ class ThamesWaterSensor(SensorEntity):
         self._unique_id = unique_id
         self._attr_should_poll = False
         self._last_daily_fetch_date: date | None = None
+        self._latest_reading_time: datetime | None = None
 
     @property
     def unique_id(self) -> str:
@@ -201,13 +202,35 @@ class ThamesWaterSensor(SensorEntity):
 
     @property
     def state(self) -> float | None:
-        """Return the sensor state (latest hourly consumption in Liters)."""
+        """Return the latest cumulative meter read in litres.
+
+        Thames Water publishes smart meter data with a lag of roughly three
+        days, so this is the most recent reading they have made available,
+        not a live total. The hour it was recorded on is exposed as the
+        ``last_reading_time`` attribute; the full backdated hourly series
+        is injected as external statistics (visible in the Energy dashboard
+        and in Developer tools > Statistics), not in this entity's history.
+        """
         return self._state
 
     @property
     def unit_of_measurement(self) -> str:
         """Return the unit of measurement (Liters)."""
         return UnitOfVolume.LITERS
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Surface when the current state was actually recorded by the meter.
+
+        The entity's state only moves when the poller fires, but the value
+        itself comes from a reading taken ~3 days earlier. Exposing the
+        reading's real timestamp makes that lag visible.
+        """
+        return {
+            "last_reading_time": self._latest_reading_time.isoformat()
+            if self._latest_reading_time is not None
+            else None,
+        }
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -307,6 +330,8 @@ class ThamesWaterSensor(SensorEntity):
                 start_dt.date(), hourly_usage
             )
             self._state = hourly_usage.Lines[-1].Read
+            if hourly_stats:
+                self._latest_reading_time = hourly_stats[-1]["start"]
             self._inject_statistics(
                 f"{DOMAIN}:thameswater_consumption_hourly",
                 "Thames Water Consumption (Hourly)",
@@ -328,6 +353,8 @@ class ThamesWaterSensor(SensorEntity):
             )
             if self._state is None:
                 self._state = daily_usage.Lines[-1].Read
+                if daily_stats:
+                    self._latest_reading_time = daily_stats[-1]["start"]
             self._inject_statistics(
                 f"{DOMAIN}:thameswater_consumption_daily",
                 "Thames Water Consumption (Daily)",
