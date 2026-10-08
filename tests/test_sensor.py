@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -285,6 +285,75 @@ class TestDailyFetchThrottling:
             await sensor.async_update()
 
         assert calls.count("D") == 2
+
+    async def test_last_reading_time_tracks_latest_hourly_line(self) -> None:
+        """The last_reading_time attribute reflects the real hour of the latest reading."""
+        sensor = _make_sensor()
+        today = date(2024, 6, 10)
+        captured: dict[str, datetime] = {}
+
+        def fake_fetch(start_dt, end_dt, granularity="H"):
+            if granularity == "H":
+                captured["start"] = start_dt
+                return _make_meter_usage(
+                    [
+                        _make_line(1.0, 100.0, "0:00"),
+                        _make_line(2.0, 102.0, "1:00"),
+                        _make_line(3.0, 105.0, "2:00"),
+                    ]
+                )
+            return _make_meter_usage([_make_line(10.0, 1000.0)])
+
+        with (
+            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(sensor, "_inject_statistics"),
+            patch.object(sensor_module, "date", _frozen_date(today)),
+        ):
+            await sensor.async_update()
+
+        expected_day = captured["start"].date()
+        assert sensor.extra_state_attributes == {
+            "last_reading_time": datetime(
+                expected_day.year,
+                expected_day.month,
+                expected_day.day,
+                2,
+                0,
+                tzinfo=LONDON_TZ,
+            ).isoformat(),
+        }
+
+    async def test_last_reading_time_falls_back_to_daily(self) -> None:
+        """With no hourly data, last_reading_time comes from the daily series."""
+        sensor = _make_sensor()
+        today = date(2024, 6, 10)
+        captured: dict[str, datetime] = {}
+
+        def fake_fetch(start_dt, end_dt, granularity="H"):
+            if granularity == "H":
+                return _make_meter_usage([])
+            captured["start"] = start_dt
+            return _make_meter_usage(
+                [
+                    _make_line(10.0, 1000.0),
+                    _make_line(12.0, 1012.0),
+                ]
+            )
+
+        with (
+            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(sensor, "_inject_statistics"),
+            patch.object(sensor_module, "date", _frozen_date(today)),
+        ):
+            await sensor.async_update()
+
+        start_day = captured["start"].date()
+        expected_last = datetime(
+            start_day.year, start_day.month, start_day.day, 0, 0, tzinfo=LONDON_TZ
+        ) + timedelta(days=1)
+        assert sensor.extra_state_attributes == {
+            "last_reading_time": expected_last.isoformat(),
+        }
 
     async def test_daily_retried_when_previous_fetch_raised(self) -> None:
         sensor = _make_sensor()
