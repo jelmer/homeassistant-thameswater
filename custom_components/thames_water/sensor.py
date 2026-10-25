@@ -28,6 +28,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.components.sensor import (
     RestoreSensor,
@@ -86,8 +87,10 @@ async def async_setup_entry(
 
     name = entry.data.get(CONF_NAME, "Thames Water Sensor")
 
+    tariff_coordinator = ThamesWaterTariffCoordinator(hass)
     sensor = ThamesWaterSensor(
         hass,
+        tariff_coordinator,
         name,
         username,
         password,
@@ -124,7 +127,6 @@ async def async_setup_entry(
     # Tariff sensors. These scrape a public, region-wide page and need no
     # credentials, so they run on their own coordinator. A failure here must not
     # break consumption/balance, so we refresh without raising ConfigEntryNotReady.
-    tariff_coordinator = ThamesWaterTariffCoordinator(hass)
     await tariff_coordinator.async_refresh()
     async_add_entities(
         ThamesWaterTariffSensor(tariff_coordinator, description)
@@ -152,6 +154,42 @@ def _generate_hourly_statistics_from_meter_usage(
     ]
 
 
+COST_STATISTIC_ID = f"{DOMAIN}:thameswater_consumption_cost"
+
+
+def price_readings(
+    consumption: list[StatisticData],
+    tariff: Tariff,
+    priced_through: datetime | None,
+    running_total: float,
+) -> list[StatisticData]:
+    """Price hourly readings at the tariff's unit rate.
+
+    Only readings inside the tariff's charging year are priced, so a reading is
+    never given a rate that was not in force on its day. A reading already
+    priced is never priced again, because cost accumulates while a consumption
+    sum is the meter's own odometer.
+    """
+    lapses = _lapse_date(tariff.effective_date)
+    rows: list[StatisticData] = []
+    for reading in sorted(consumption, key=lambda row: row["start"]):
+        if priced_through is not None and reading["start"] <= priced_through:
+            continue
+        day = reading["start"].astimezone(LONDON_TZ).date()
+        if not tariff.effective_date <= day < lapses:
+            continue
+        cost = reading["state"] * tariff.unit_rate_per_litre
+        running_total += cost
+        rows.append(
+            StatisticData(
+                start=reading["start"],
+                state=round(cost, 4),
+                sum=round(running_total, 4),
+            )
+        )
+    return rows
+
+
 class ThamesWaterSensor(SensorEntity):
     """Thames Water Sensor class."""
 
@@ -162,6 +200,7 @@ class ThamesWaterSensor(SensorEntity):
     def __init__(
         self,
         hass: HomeAssistant,
+        tariff_coordinator: ThamesWaterTariffCoordinator,
         name: str,
         username: str,
         password: str,
@@ -171,6 +210,7 @@ class ThamesWaterSensor(SensorEntity):
     ) -> None:
         """Initialize the sensor."""
         self._hass = hass
+        self._tariff_coordinator = tariff_coordinator
         self._name = name
         self._state: float | None = None
 
@@ -329,6 +369,90 @@ class ThamesWaterSensor(SensorEntity):
                 "Thames Water Consumption",
                 hourly_stats,
             )
+            await self._async_write_cost_statistics(hourly_stats)
+
+    async def _async_write_cost_statistics(
+        self, consumption: list[StatisticData]
+    ) -> None:
+        """Write what the new readings cost, for the Energy dashboard.
+
+        The dashboard's own cost sensor prices whatever the meter reports at the
+        rate showing when it reports it, which cannot put last year's rate on
+        last year's water, and Thames Water reports days late.
+        """
+        tariff = self._tariff_coordinator.data
+        if tariff is None:
+            _LOGGER.debug("No tariff available yet, so nothing was priced")
+            return
+
+        priced_through, running_total = await self._async_cost_watermark()
+        if priced_through is None:
+            # Nothing has ever been priced, and the readings already recorded
+            # are worth as much as the ones just fetched.
+            consumption = await self._async_all_consumption(consumption)
+
+        rows = price_readings(consumption, tariff, priced_through, running_total)
+        if not rows:
+            return
+        _LOGGER.debug(
+            "Injecting %d cost statistics (first: %s, last: %s)",
+            len(rows),
+            rows[0]["start"],
+            rows[-1]["start"],
+        )
+        async_add_external_statistics(
+            self._hass,
+            StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                mean_type=StatisticMeanType.NONE,
+                name="Thames Water Consumption Cost",
+                source=DOMAIN,
+                statistic_id=COST_STATISTIC_ID,
+                unit_class=None,
+                unit_of_measurement="GBP",
+            ),
+            rows,
+        )
+
+    async def _async_cost_watermark(self) -> tuple[datetime | None, float]:
+        """Return how far cost has been priced, and the total to carry on from."""
+        last = await get_instance(self._hass).async_add_executor_job(
+            get_last_statistics, self._hass, 1, COST_STATISTIC_ID, True, {"sum"}
+        )
+        rows = last.get(COST_STATISTIC_ID)
+        if not rows:
+            return None, 0.0
+        return dt_util.utc_from_timestamp(rows[0]["start"]), rows[0].get("sum") or 0.0
+
+    async def _async_all_consumption(
+        self, fetched: list[StatisticData]
+    ) -> list[StatisticData]:
+        """Return every consumption reading on record, the fetched rows winning.
+
+        The rows just fetched are queued for the recorder rather than in it, so
+        they are merged over what a read returns.
+        """
+        history = await get_instance(self._hass).async_add_executor_job(
+            statistics_during_period,
+            self._hass,
+            dt_util.utc_from_timestamp(0),
+            None,
+            {CONSUMPTION_STATISTIC_ID},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        readings = {
+            dt_util.utc_from_timestamp(row["start"]): StatisticData(
+                start=dt_util.utc_from_timestamp(row["start"]),
+                state=row["state"],
+                sum=row["sum"],
+            )
+            for row in history.get(CONSUMPTION_STATISTIC_ID, [])
+        }
+        readings.update({row["start"]: row for row in fetched})
+        return [readings[start] for start in sorted(readings)]
 
 
 class ThamesWaterBalanceSensor(SensorEntity):
@@ -500,13 +624,18 @@ TARIFF_SENSORS: tuple[ThamesWaterTariffSensorDescription, ...] = (
 )
 
 
+def _lapse_date(effective_date: date) -> date:
+    """The 1 April on which charges that took effect on that date lapse."""
+    return date(effective_date.year + 1, 4, 1)
+
+
 def _still_in_force(effective_date: date) -> bool:
     """Whether charges that took effect on that date still apply.
 
     A charging year runs from 1 April to 31 March, so charges lapse on the
     1 April after the one they started on.
     """
-    lapses = date(effective_date.year + 1, 4, 1)
+    lapses = _lapse_date(effective_date)
     return datetime.now(LONDON_TZ).date() < lapses
 
 
