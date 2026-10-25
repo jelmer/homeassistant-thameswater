@@ -174,3 +174,43 @@ async def test_an_empty_meter_list_is_an_answer_not_a_failure(
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["step_id"] == "meter"
     assert result["errors"] == {"base": "no_meters"}
+
+
+class _ReadyClient(_AccountClient):
+    """A smart-metered account with one meter."""
+
+    def get_account(self) -> object:
+        return SimpleNamespace(is_smart_metered=True)
+
+    def get_meter_numbers(self) -> list[str]:
+        return ["meter-1"]
+
+
+async def test_the_meter_step_does_not_ask_for_a_refresh_interval(
+    hass: HomeAssistant,
+    mock_recorder_before_hass: None,
+) -> None:
+    """Choosing the meter is all that is left to ask, and all that is stored."""
+    flow_id = await _start(hass)
+    with (
+        patch(
+            "custom_components.thames_water.config_flow."
+            "ThamesWaterConfigFlow._authenticate",
+            return_value=_ReadyClient(OSError("unused")),
+        ),
+        patch("custom_components.thames_water.async_setup_entry", return_value=True),
+    ):
+        result = await hass.config_entries.flow.async_configure(flow_id, CREDENTIALS)
+        assert result["step_id"] == "meter"
+        assert list(result["data_schema"].schema) == ["meter_id"]
+
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {"meter_id": "meter-1"}
+        )
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"] == {
+        **CREDENTIALS,
+        "account_number": "12345678",
+        "meter_id": "meter-1",
+    }
