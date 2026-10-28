@@ -19,12 +19,16 @@ from thameswaterapi import (
     meter_usage_lines_to_timeseries,
 )
 
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import async_add_external_statistics
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
 from homeassistant.components.sensor import (
     RestoreSensor,
     SensorDeviceClass,
@@ -42,6 +46,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
@@ -51,6 +56,14 @@ SELENIUM_TIMEOUT = 60
 
 # The tariff is a fixed annual published scheme, so once a day is ample.
 TARIFF_SCAN_INTERVAL = timedelta(hours=24)
+
+CONSUMPTION_STATISTIC_ID = f"{DOMAIN}:thameswater_consumption"
+
+# How far back to fetch on first setup, when there is no statistic to resume
+# from. Readings lag by about three days.
+INITIAL_HISTORY = timedelta(days=6)
+
+LONDON_TZ = ZoneInfo("Europe/London")
 
 
 async def async_setup_entry(
@@ -230,8 +243,8 @@ class ThamesWaterSensor(SensorEntity):
 
     def _fetch_meter_usage(
         self,
-        start_dt: datetime,
-        end_dt: datetime,
+        start: date,
+        end: date,
         granularity: Literal["H", "D", "M"] = "H",
     ) -> MeterUsage:
         """Fetch meter usage from Thames Water API (blocking, run in executor)."""
@@ -241,7 +254,7 @@ class ThamesWaterSensor(SensorEntity):
             account_number=int(self._account_number),
         )
         return thames_water.get_meter_usage(
-            self._meter_id, start_dt, end_dt, granularity=granularity
+            self._meter_id, start, end, granularity=granularity
         )
 
     def _inject_statistics(
@@ -270,16 +283,29 @@ class ThamesWaterSensor(SensorEntity):
         )
         async_add_external_statistics(self._hass, metadata, stats)
 
+    async def _async_start_day(self) -> date:
+        """Return the day to resume fetching from.
+
+        Thames Water publishes whole days, so this is the day after the newest
+        stored statistic, or a short look-back on first setup.
+        """
+        last = await get_instance(self._hass).async_add_executor_job(
+            get_last_statistics, self._hass, 1, CONSUMPTION_STATISTIC_ID, False, set()
+        )
+        rows = last.get(CONSUMPTION_STATISTIC_ID)
+        if not rows:
+            return datetime.now(LONDON_TZ).date() - INITIAL_HISTORY
+        newest = dt_util.utc_from_timestamp(rows[0]["start"])
+        return newest.astimezone(LONDON_TZ).date() + timedelta(days=1)
+
     async def async_update(self):
         """Fetch data, build statistics, and inject external statistics."""
-        end_dt = (datetime.now() - timedelta(days=3)).replace(
-            minute=0, second=0, microsecond=0
-        )
-        start_dt = end_dt - timedelta(days=3)
+        start = await self._async_start_day()
+        end = datetime.now(LONDON_TZ).date()
 
         try:
             hourly_usage = await self._hass.async_add_executor_job(
-                self._fetch_meter_usage, start_dt, end_dt, "H"
+                self._fetch_meter_usage, start, end, "H"
             )
         except Exception:
             _LOGGER.exception("Failed to fetch hourly meter usage from Thames Water")
@@ -289,27 +315,17 @@ class ThamesWaterSensor(SensorEntity):
         if hourly_usage is not None and len(hourly_usage.Lines) > 0:
             _LOGGER.info("Fetched %d hourly entries", len(hourly_usage.Lines))
             hourly_stats = _generate_hourly_statistics_from_meter_usage(
-                start_dt.date(), hourly_usage
+                start, hourly_usage
             )
             self._state = hourly_usage.Lines[-1].Read
-            if hourly_stats:
-                self._latest_reading_time = hourly_stats[-1]["start"]
+            self._latest_reading_time = hourly_stats[-1]["start"]
             self._inject_statistics(
                 f"{DOMAIN}:thameswater_consumption_hourly",
                 "Thames Water Consumption (Hourly)",
                 hourly_stats,
             )
-        else:
-            hourly_stats = None
-            _LOGGER.warning(
-                "Thames Water returned no hourly data for %s to %s",
-                start_dt,
-                end_dt,
-            )
-
-        if hourly_stats is not None:
             self._inject_statistics(
-                f"{DOMAIN}:thameswater_consumption",
+                CONSUMPTION_STATISTIC_ID,
                 "Thames Water Consumption",
                 hourly_stats,
             )
@@ -491,7 +507,7 @@ def _still_in_force(effective_date: date) -> bool:
     1 April after the one they started on.
     """
     lapses = date(effective_date.year + 1, 4, 1)
-    return datetime.now(ZoneInfo("Europe/London")).date() < lapses
+    return datetime.now(LONDON_TZ).date() < lapses
 
 
 class ThamesWaterTariffSensor(

@@ -64,6 +64,8 @@ The water statistics can be integrated into HA [Home Energy Management](https://
 
 It will attempt to fetch the latest data at 00:00 and 12:00 every day.
 
+Each refresh resumes from the last stored reading, so late or missed days get filled in. On first setup it starts six days back, which given the delay above yields about three days of readings.
+
 [![Open your Home Assistant instance and show your Energy configuration panel.](https://my.home-assistant.io/badges/config_energy.svg)](https://my.home-assistant.io/redirect/config_energy/)
 
 ![Dashboard](./dashboard.png)

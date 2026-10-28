@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
 from thameswaterapi import Line, MeterUsage
 
 from custom_components.thames_water.sensor import (
+    CONSUMPTION_STATISTIC_ID,
+    INITIAL_HISTORY,
     ThamesWaterSensor,
     _generate_hourly_statistics_from_meter_usage,
     _still_in_force,
@@ -144,13 +148,46 @@ def _make_sensor() -> ThamesWaterSensor:
     )
 
 
+@contextmanager
+def _recorder_with_newest(newest: datetime | None):
+    """Patch the recorder lookup of the newest stored consumption statistic."""
+    rows = (
+        {}
+        if newest is None
+        else {CONSUMPTION_STATISTIC_ID: [{"start": newest.timestamp()}]}
+    )
+    instance = MagicMock()
+
+    async def run(func, *args):
+        return func(*args)
+
+    instance.async_add_executor_job = run
+    with (
+        patch(
+            "custom_components.thames_water.sensor.get_instance", return_value=instance
+        ),
+        patch(
+            "custom_components.thames_water.sensor.get_last_statistics",
+            return_value=rows,
+        ),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def no_statistics_yet():
+    """By default nothing has been recorded, as on a first setup."""
+    with _recorder_with_newest(None):
+        yield
+
+
 class TestUpdate:
     async def test_only_hourly_usage_is_fetched(self) -> None:
         """Each cycle makes a single hourly request and no daily one."""
         sensor = _make_sensor()
         calls: list[str] = []
 
-        def fake_fetch(start_dt, end_dt, granularity="H"):
+        def fake_fetch(start, end, granularity="H"):
             calls.append(granularity)
             return _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
 
@@ -169,10 +206,10 @@ class TestUpdate:
     async def test_last_reading_time_tracks_latest_hourly_line(self) -> None:
         """The last_reading_time attribute reflects the real hour of the latest reading."""
         sensor = _make_sensor()
-        captured: dict[str, datetime] = {}
+        captured: dict[str, date] = {}
 
-        def fake_fetch(start_dt, end_dt, granularity="H"):
-            captured["start"] = start_dt
+        def fake_fetch(start, end, granularity="H"):
+            captured["start"] = start
             return _make_meter_usage(
                 [
                     _make_line(1.0, 100.0, "0:00"),
@@ -187,7 +224,7 @@ class TestUpdate:
         ):
             await sensor.async_update()
 
-        expected_day = captured["start"].date()
+        expected_day = captured["start"]
         assert sensor.extra_state_attributes == {
             "last_reading_time": datetime(
                 expected_day.year,
@@ -198,3 +235,60 @@ class TestUpdate:
                 tzinfo=LONDON_TZ,
             ).isoformat(),
         }
+
+
+class TestResume:
+    async def _fetch_window(self, newest: datetime | None) -> dict[str, date]:
+        sensor = _make_sensor()
+        captured: dict[str, date] = {}
+
+        def fake_fetch(start, end, granularity="H"):
+            captured["start"], captured["end"] = start, end
+            return _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
+
+        with (
+            _recorder_with_newest(newest),
+            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(sensor, "_inject_statistics"),
+        ):
+            await sensor.async_update()
+        return captured
+
+    async def test_starts_on_the_day_after_the_newest_statistic_and_ends_today(
+        self,
+    ) -> None:
+        window = await self._fetch_window(datetime(2026, 10, 20, 13, tzinfo=LONDON_TZ))
+
+        assert window["start"] == date(2026, 10, 21)
+        assert window["end"] == datetime.now(LONDON_TZ).date()
+
+    async def test_a_statistic_just_after_local_midnight_is_that_london_day(
+        self,
+    ) -> None:
+        """00:00 BST is the previous day in UTC but the same day in London."""
+        window = await self._fetch_window(datetime(2026, 7, 2, 0, tzinfo=LONDON_TZ))
+
+        assert window["start"] == date(2026, 7, 3)
+
+    async def test_first_setup_looks_back_a_fixed_period(self) -> None:
+        window = await self._fetch_window(None)
+
+        assert window["start"] == (datetime.now(LONDON_TZ).date() - INITIAL_HISTORY)
+
+    async def test_statistics_are_dated_from_the_day_resumed_from(self) -> None:
+        sensor = _make_sensor()
+        usage = _make_meter_usage(
+            [_make_line(1.0, 100.0, "0:00"), _make_line(2.0, 102.0, "1:00")]
+        )
+        with (
+            _recorder_with_newest(datetime(2026, 10, 20, 5, tzinfo=LONDON_TZ)),
+            patch.object(sensor, "_fetch_meter_usage", return_value=usage),
+            patch.object(sensor, "_inject_statistics") as inject,
+        ):
+            await sensor.async_update()
+
+        stats = inject.call_args_list[0].args[2]
+        assert [row["start"] for row in stats] == [
+            datetime(2026, 10, 21, 0, tzinfo=LONDON_TZ),
+            datetime(2026, 10, 21, 1, tzinfo=LONDON_TZ),
+        ]
