@@ -172,7 +172,7 @@ def price_readings(
     """
     lapses = _lapse_date(tariff.effective_date)
     rows: list[StatisticData] = []
-    for reading in sorted(consumption, key=lambda row: row["start"]):
+    for reading in consumption:
         if priced_through is not None and reading["start"] <= priced_through:
             continue
         day = reading["start"].astimezone(LONDON_TZ).date()
@@ -386,12 +386,17 @@ class ThamesWaterSensor(SensorEntity):
             return
 
         priced_through, running_total = await self._async_cost_watermark()
-        if priced_through is None:
-            # Nothing has ever been priced, and the readings already recorded
-            # are worth as much as the ones just fetched.
-            consumption = await self._async_all_consumption(consumption)
+        # Readings recorded but never priced are priced too, such as those from
+        # before the tariff was available.
+        unpriced = [
+            row
+            for row in await self._async_stored_consumption(priced_through)
+            if row["start"] < consumption[0]["start"]
+        ]
 
-        rows = price_readings(consumption, tariff, priced_through, running_total)
+        rows = price_readings(
+            unpriced + consumption, tariff, priced_through, running_total
+        )
         if not rows:
             return
         _LOGGER.debug(
@@ -425,34 +430,28 @@ class ThamesWaterSensor(SensorEntity):
             return None, 0.0
         return dt_util.utc_from_timestamp(rows[0]["start"]), rows[0].get("sum") or 0.0
 
-    async def _async_all_consumption(
-        self, fetched: list[StatisticData]
+    async def _async_stored_consumption(
+        self, since: datetime | None
     ) -> list[StatisticData]:
-        """Return every consumption reading on record, the fetched rows winning.
-
-        The rows just fetched are queued for the recorder rather than in it, so
-        they are merged over what a read returns.
-        """
+        """Return the consumption readings on record from the given hour on."""
         history = await get_instance(self._hass).async_add_executor_job(
             statistics_during_period,
             self._hass,
-            dt_util.utc_from_timestamp(0),
+            since or dt_util.utc_from_timestamp(0),
             None,
             {CONSUMPTION_STATISTIC_ID},
             "hour",
             None,
             {"state", "sum"},
         )
-        readings = {
-            dt_util.utc_from_timestamp(row["start"]): StatisticData(
+        return [
+            StatisticData(
                 start=dt_util.utc_from_timestamp(row["start"]),
                 state=row["state"],
                 sum=row["sum"],
             )
             for row in history.get(CONSUMPTION_STATISTIC_ID, [])
-        }
-        readings.update({row["start"]: row for row in fetched})
-        return [readings[start] for start in sorted(readings)]
+        ]
 
 
 class ThamesWaterBalanceSensor(SensorEntity):

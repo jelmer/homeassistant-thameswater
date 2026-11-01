@@ -257,6 +257,43 @@ class TestCostStatistic:
         assert [row["start"].hour for row in rows] == [1]
         assert rows[0]["sum"] == 0.4
 
+    async def test_recorded_readings_never_priced_are_priced_with_the_new_ones(
+        self,
+    ) -> None:
+        sensor = _make_sensor(_tariff())
+        history = [
+            {
+                "start": datetime(2026, 10, 1, hour, tzinfo=LONDON_TZ).timestamp(),
+                "state": 100.0,
+                "sum": 100.0,
+            }
+            for hour in (0, 1)
+        ]
+        fetched = [_reading(date(2026, 10, 1), 2, 100)]
+
+        add = await self._run(sensor, 0.2, history, fetched)
+
+        rows = add.call_args.args[2]
+        assert [row["start"].astimezone(LONDON_TZ).hour for row in rows] == [1, 2]
+        assert [row["sum"] for row in rows] == [0.4, 0.6]
+
+    async def test_a_recorded_reading_is_not_priced_again_as_a_fetched_one(
+        self,
+    ) -> None:
+        sensor = _make_sensor(_tariff())
+        history = [
+            {
+                "start": datetime(2026, 10, 1, 1, tzinfo=LONDON_TZ).timestamp(),
+                "state": 100.0,
+                "sum": 100.0,
+            }
+        ]
+        fetched = [_reading(date(2026, 10, 1), 1, 100)]
+
+        add = await self._run(sensor, 0.2, history, fetched)
+
+        assert [row["sum"] for row in add.call_args.args[2]] == [0.4]
+
     async def test_nothing_is_written_without_a_tariff(self) -> None:
         sensor = _make_sensor(None)
 
