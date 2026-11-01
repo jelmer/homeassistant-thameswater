@@ -59,6 +59,7 @@ SELENIUM_TIMEOUT = 60
 TARIFF_SCAN_INTERVAL = timedelta(hours=24)
 
 CONSUMPTION_STATISTIC_ID = f"{DOMAIN}:thameswater_consumption"
+COST_STATISTIC_ID = f"{DOMAIN}:thameswater_consumption_cost"
 
 # How far back to fetch on first setup, when there is no statistic to resume
 # from. Readings lag by about three days.
@@ -87,7 +88,13 @@ async def async_setup_entry(
 
     name = entry.data.get(CONF_NAME, "Thames Water Sensor")
 
+    # The tariff sensors scrape a public, region-wide page and need no
+    # credentials, so they run on their own coordinator. It refreshes before the
+    # consumption sensor's first update, which prices readings with it. A failure
+    # here must not break consumption/balance, so we refresh without raising
+    # ConfigEntryNotReady.
     tariff_coordinator = ThamesWaterTariffCoordinator(hass)
+    await tariff_coordinator.async_refresh()
     sensor = ThamesWaterSensor(
         hass,
         tariff_coordinator,
@@ -124,10 +131,6 @@ async def async_setup_entry(
         )
     )
 
-    # Tariff sensors. These scrape a public, region-wide page and need no
-    # credentials, so they run on their own coordinator. A failure here must not
-    # break consumption/balance, so we refresh without raising ConfigEntryNotReady.
-    await tariff_coordinator.async_refresh()
     async_add_entities(
         ThamesWaterTariffSensor(tariff_coordinator, description)
         for description in TARIFF_SENSORS
@@ -154,21 +157,15 @@ def _generate_hourly_statistics_from_meter_usage(
     ]
 
 
-COST_STATISTIC_ID = f"{DOMAIN}:thameswater_consumption_cost"
-
-
-def price_readings(
+def _price_readings(
     consumption: list[StatisticData],
     tariff: Tariff,
     priced_through: datetime | None,
     running_total: float,
 ) -> list[StatisticData]:
-    """Price hourly readings at the tariff's unit rate.
+    """Price the readings inside the tariff's charging year at its unit rate.
 
-    Only readings inside the tariff's charging year are priced, so a reading is
-    never given a rate that was not in force on its day. A reading already
-    priced is never priced again, because cost accumulates while a consumption
-    sum is the meter's own odometer.
+    Readings up to ``priced_through`` are skipped, since cost is a running total.
     """
     lapses = _lapse_date(tariff.effective_date)
     rows: list[StatisticData] = []
@@ -374,12 +371,7 @@ class ThamesWaterSensor(SensorEntity):
     async def _async_write_cost_statistics(
         self, consumption: list[StatisticData]
     ) -> None:
-        """Write what the new readings cost, for the Energy dashboard.
-
-        The dashboard's own cost sensor prices whatever the meter reports at the
-        rate showing when it reports it, which cannot put last year's rate on
-        last year's water, and Thames Water reports days late.
-        """
+        """Write what the readings cost, for the Energy dashboard."""
         tariff = self._tariff_coordinator.data
         if tariff is None:
             _LOGGER.debug("No tariff available yet, so nothing was priced")
@@ -394,7 +386,7 @@ class ThamesWaterSensor(SensorEntity):
             if row["start"] < consumption[0]["start"]
         ]
 
-        rows = price_readings(
+        rows = _price_readings(
             unpriced + consumption, tariff, priced_through, running_total
         )
         if not rows:

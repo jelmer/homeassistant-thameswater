@@ -17,8 +17,8 @@ from custom_components.thames_water.sensor import (
     INITIAL_HISTORY,
     ThamesWaterSensor,
     _generate_hourly_statistics_from_meter_usage,
+    _price_readings,
     _still_in_force,
-    price_readings,
 )
 
 LONDON_TZ = ZoneInfo("Europe/London")
@@ -139,7 +139,7 @@ def _reading(day: date, hour: int, litres: float) -> StatisticData:
 
 class TestPriceReadings:
     def test_prices_at_the_unit_rate_and_accumulates(self) -> None:
-        rows = price_readings(
+        rows = _price_readings(
             [_reading(date(2026, 10, 1), 0, 100), _reading(date(2026, 10, 1), 1, 50)],
             _tariff(),
             None,
@@ -148,7 +148,7 @@ class TestPriceReadings:
         assert [(row["state"], row["sum"]) for row in rows] == [(0.2, 0.2), (0.1, 0.3)]
 
     def test_continues_from_the_running_total(self) -> None:
-        rows = price_readings(
+        rows = _price_readings(
             [_reading(date(2026, 10, 1), 0, 100)], _tariff(), None, 10.0
         )
         assert rows[0]["sum"] == 10.2
@@ -156,12 +156,12 @@ class TestPriceReadings:
     def test_a_reading_already_priced_is_not_priced_again(self) -> None:
         first = _reading(date(2026, 10, 1), 0, 100)
         second = _reading(date(2026, 10, 1), 1, 100)
-        rows = price_readings([first, second], _tariff(), first["start"], 0.2)
+        rows = _price_readings([first, second], _tariff(), first["start"], 0.2)
         assert [row["start"] for row in rows] == [second["start"]]
         assert rows[0]["sum"] == 0.4
 
     def test_readings_before_the_tariff_took_effect_are_left_unpriced(self) -> None:
-        rows = price_readings(
+        rows = _price_readings(
             [_reading(date(2026, 3, 31), 23, 100), _reading(date(2026, 4, 1), 0, 100)],
             _tariff(),
             None,
@@ -170,7 +170,7 @@ class TestPriceReadings:
         assert [row["start"].date() for row in rows] == [date(2026, 4, 1)]
 
     def test_readings_after_the_charging_year_wait_for_the_next_tariff(self) -> None:
-        rows = price_readings(
+        rows = _price_readings(
             [_reading(date(2027, 3, 31), 23, 100), _reading(date(2027, 4, 1), 0, 100)],
             _tariff(),
             None,
@@ -179,6 +179,7 @@ class TestPriceReadings:
         assert [row["start"].date() for row in rows] == [date(2027, 3, 31)]
 
 
+@contextmanager
 def _recorder(newest_cost: float | None, history: list[dict]):
     instance = MagicMock()
 
@@ -197,7 +198,7 @@ def _recorder(newest_cost: float | None, history: list[dict]):
                 }
             ]
         }
-    return (
+    with (
         patch(
             "custom_components.thames_water.sensor.get_instance", return_value=instance
         ),
@@ -209,16 +210,14 @@ def _recorder(newest_cost: float | None, history: list[dict]):
             "custom_components.thames_water.sensor.statistics_during_period",
             return_value={CONSUMPTION_STATISTIC_ID: history},
         ),
-    )
+    ):
+        yield
 
 
 class TestCostStatistic:
     async def _run(self, sensor, newest_cost, history, fetched):
-        get_instance_patch, last_patch, during_patch = _recorder(newest_cost, history)
         with (
-            get_instance_patch,
-            last_patch,
-            during_patch,
+            _recorder(newest_cost, history),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
             ) as add,
@@ -306,26 +305,21 @@ class TestUpdateWritesCost:
     async def test_a_refresh_prices_what_it_fetched(self) -> None:
         """Each refresh passes its new readings on to the cost statistic."""
         sensor = _make_sensor(_tariff())
-        get_instance_patch, last_patch, during_patch = _recorder(None, [])
 
-        def fake_fetch(start_dt, end_dt, granularity="H"):
+        def fake_fetch(start, end, granularity="H"):
             return _make_meter_usage(
                 [_make_line(100.0, 500.0, "0:00"), _make_line(50.0, 550.0, "1:00")]
             )
 
         with (
-            get_instance_patch,
-            last_patch,
-            during_patch,
+            _recorder(None, []),
+            patch.object(sensor, "_async_start_day", return_value=date(2026, 10, 25)),
             patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
             patch.object(sensor, "_inject_statistics"),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
             ) as add,
-            patch("custom_components.thames_water.sensor.datetime") as fake_datetime,
         ):
-            fake_datetime.now.return_value = datetime(2026, 10, 25, 12, 0)
-            fake_datetime.side_effect = datetime
             await sensor.async_update()
 
         assert add.call_args.args[1]["statistic_id"] == COST_STATISTIC_ID
