@@ -3,11 +3,11 @@
 import logging
 
 import voluptuous as vol
+from thameswaterapi import AuthenticationError, ThamesWater
 
 from homeassistant import config_entries
 
 from .const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
-from thameswaterapi import AuthenticationError, ThamesWater
 
 _LOGGER = logging.getLogger(__name__)
 
