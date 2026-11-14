@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder.models import StatisticData
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -17,7 +18,7 @@ from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
 )
-from thameswaterapi import Line, MeterUsage, Tariff
+from thameswaterapi import Account, AuthenticationError, Line, MeterUsage, Tariff
 
 from custom_components.thames_water.const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
 from custom_components.thames_water.sensor import (
@@ -32,6 +33,7 @@ from custom_components.thames_water.sensor import (
 )
 
 LONDON_TZ = ZoneInfo("Europe/London")
+SENSOR = "custom_components.thames_water.sensor"
 
 
 def _make_meter_usage(lines: list[Line]) -> MeterUsage:
@@ -318,17 +320,17 @@ class TestUpdateWritesCost:
         """Each refresh passes its new readings on to the cost statistic."""
         coordinator = _make_coordinator(_tariff())
 
-        def fake_fetch(start, end, granularity="H"):
+        def fake_fetch(start, end):
             return _make_meter_usage(
                 [_make_line(100.0, 500.0, "0:00"), _make_line(50.0, 550.0, "1:00")]
-            )
+            ), None
 
         with (
             _recorder(None, []),
             patch.object(
                 coordinator, "_async_start_day", return_value=date(2026, 10, 25)
             ),
-            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_fetch", side_effect=fake_fetch),
             patch.object(coordinator, "_inject_statistics"),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
@@ -407,19 +409,17 @@ class TestUpdate:
     async def test_only_hourly_usage_is_fetched(self) -> None:
         """Each cycle makes a single hourly request and no daily one."""
         coordinator = _make_coordinator()
-        calls: list[str] = []
-
-        def fake_fetch(start, end, granularity="H"):
-            calls.append(granularity)
-            return _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
+        usage = _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
 
         with (
-            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch(f"{SENSOR}.ThamesWater") as thames_water,
             patch.object(coordinator, "_inject_statistics") as inject,
         ):
+            thames_water.return_value.get_meter_usage.return_value = usage
             await coordinator._async_update_data()
 
-        assert calls == ["H"]
+        calls = thames_water.return_value.get_meter_usage.call_args_list
+        assert [call.kwargs["granularity"] for call in calls] == ["H"]
         assert [call.args[0] for call in inject.call_args_list] == [
             "thames_water:thameswater_consumption_hourly",
             "thames_water:thameswater_consumption",
@@ -430,7 +430,7 @@ class TestUpdate:
         coordinator = _make_coordinator()
         captured: dict[str, date] = {}
 
-        def fake_fetch(start, end, granularity="H"):
+        def fake_fetch(start, end):
             captured["start"] = start
             return _make_meter_usage(
                 [
@@ -438,10 +438,10 @@ class TestUpdate:
                     _make_line(2.0, 102.0, "1:00"),
                     _make_line(3.0, 105.0, "2:00"),
                 ]
-            )
+            ), None
 
         with (
-            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_fetch", side_effect=fake_fetch),
             patch.object(coordinator, "_inject_statistics"),
         ):
             coordinator.data = await coordinator._async_update_data()
@@ -462,14 +462,14 @@ class TestUpdate:
 
     async def test_a_refresh_with_nothing_new_keeps_the_last_reading(self) -> None:
         coordinator = _make_coordinator()
-        usage = [
-            _make_meter_usage([_make_line(1.0, 100.0, "0:00")]),
-            _make_meter_usage([]),
-            RuntimeError("Thames Water is down"),
+        fetched = [
+            (_make_meter_usage([_make_line(1.0, 100.0, "0:00")]), None),
+            (_make_meter_usage([]), None),
+            (None, None),
         ]
 
         with (
-            patch.object(coordinator, "_fetch_meter_usage", side_effect=usage),
+            patch.object(coordinator, "_fetch", side_effect=fetched),
             patch.object(coordinator, "_inject_statistics"),
         ):
             first = coordinator.data = await coordinator._async_update_data()
@@ -483,13 +483,13 @@ class TestResume:
         coordinator = _make_coordinator()
         captured: dict[str, date] = {}
 
-        def fake_fetch(start, end, granularity="H"):
+        def fake_fetch(start, end):
             captured["start"], captured["end"] = start, end
-            return _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
+            return _make_meter_usage([_make_line(1.0, 1.0, "0:00")]), None
 
         with (
             _recorder_with_newest(newest),
-            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_fetch", side_effect=fake_fetch),
             patch.object(coordinator, "_inject_statistics"),
         ):
             await coordinator._async_update_data()
@@ -523,7 +523,7 @@ class TestResume:
         )
         with (
             _recorder_with_newest(datetime(2026, 10, 20, 5, tzinfo=LONDON_TZ)),
-            patch.object(coordinator, "_fetch_meter_usage", return_value=usage),
+            patch.object(coordinator, "_fetch", return_value=(usage, None)),
             patch.object(coordinator, "_inject_statistics") as inject,
         ):
             await coordinator._async_update_data()
@@ -535,7 +535,8 @@ class TestResume:
         ]
 
 
-SENSOR = "custom_components.thames_water.sensor"
+CONSUMPTION = "sensor.thames_water_sensor"
+BALANCE = "sensor.thames_water_outstanding_balance"
 ENTRY_DATA = {
     "username": "someone@example.com",
     "password": "hunter2",
@@ -551,13 +552,20 @@ def client() -> Generator[MagicMock]:
     client.get_meter_usage.return_value = _make_meter_usage(
         [_make_line(10.0, 66289.0, "23:00")]
     )
+    client.get_account.return_value = Account(
+        contractAccountNumber=ENTRY_DATA["account_number"],
+        paymentDueAmount=12.34,
+        currentBalance=-12.34,
+        isInCredit=False,
+    )
     with (
         _recorder(None, []),
         patch("homeassistant.components.recorder.async_setup", return_value=True),
         patch(f"{SENSOR}.async_add_external_statistics"),
         patch(f"{SENSOR}.get_tariff", return_value=_tariff()),
-        patch(f"{SENSOR}.ThamesWater", return_value=client),
+        patch(f"{SENSOR}.ThamesWater", return_value=client) as thames_water,
     ):
+        client.constructed = thames_water
         yield client
 
 
@@ -570,22 +578,57 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
 
 
 class TestSetup:
-    async def test_the_consumption_sensor_shows_the_latest_reading(
+    async def test_one_sign_in_serves_both_sensors(
         self, hass: HomeAssistant, client: MagicMock
     ) -> None:
         await _setup(hass)
 
-        assert hass.states.get("sensor.thames_water_sensor").state == "66289.0"
+        assert client.constructed.call_count == 1
+        assert client.authenticate.call_count == 1
+        assert hass.states.get(CONSUMPTION).state == "66289.0"
+        balance = hass.states.get(BALANCE)
+        assert balance.state == "12.34"
+        assert balance.attributes["current_balance"] == -12.34
+        assert balance.attributes["is_in_credit"] is False
 
-    async def test_statistics_are_still_fetched_with_the_sensor_disabled(
+    async def test_a_failed_usage_fetch_keeps_the_balance(
         self, hass: HomeAssistant, client: MagicMock
     ) -> None:
-        er.async_get(hass).async_get_or_create(
-            "sensor",
-            DOMAIN,
+        client.get_meter_usage.side_effect = RuntimeError("no readings today")
+        await _setup(hass)
+
+        assert hass.states.get(CONSUMPTION).state == STATE_UNKNOWN
+        assert hass.states.get(BALANCE).state == "12.34"
+
+    async def test_a_failed_account_fetch_keeps_the_reading(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.get_account.side_effect = RuntimeError("no account today")
+        await _setup(hass)
+
+        assert hass.states.get(CONSUMPTION).state == "66289.0"
+        assert hass.states.get(BALANCE).state == STATE_UNKNOWN
+
+    async def test_a_failed_sign_in_makes_both_unavailable(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.authenticate.side_effect = AuthenticationError("wrong password")
+        await _setup(hass)
+
+        assert hass.states.get(CONSUMPTION).state == STATE_UNAVAILABLE
+        assert hass.states.get(BALANCE).state == STATE_UNAVAILABLE
+
+    async def test_statistics_are_still_fetched_with_the_sensors_disabled(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        registry = er.async_get(hass)
+        for unique_id in (
             f"water_usage_{ENTRY_DATA['meter_id']}",
-            disabled_by=er.RegistryEntryDisabler.USER,
-        )
+            f"thames_water_balance_{ENTRY_DATA['account_number']}",
+        ):
+            registry.async_get_or_create(
+                "sensor", DOMAIN, unique_id, disabled_by=er.RegistryEntryDisabler.USER
+            )
         await _setup(hass)
         assert client.get_meter_usage.call_count == 1
 
