@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder.models import StatisticData
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 from thameswaterapi import Line, MeterUsage, Tariff
 
+from custom_components.thames_water.const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
 from custom_components.thames_water.sensor import (
     CONSUMPTION_STATISTIC_ID,
     COST_STATISTIC_ID,
     INITIAL_HISTORY,
+    ThamesWaterCoordinator,
     ThamesWaterSensor,
     _generate_hourly_statistics_from_meter_usage,
     _price_readings,
@@ -215,18 +225,18 @@ def _recorder(newest_cost: float | None, history: list[dict]):
 
 
 class TestCostStatistic:
-    async def _run(self, sensor, newest_cost, history, fetched):
+    async def _run(self, coordinator, newest_cost, history, fetched):
         with (
             _recorder(newest_cost, history),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
             ) as add,
         ):
-            await sensor._async_write_cost_statistics(fetched)
+            await coordinator._async_write_cost_statistics(fetched)
         return add
 
     async def test_first_write_prices_the_history_already_recorded(self) -> None:
-        sensor = _make_sensor(_tariff())
+        coordinator = _make_coordinator(_tariff())
         history = [
             {
                 "start": datetime(2026, 9, 30, 23, tzinfo=LONDON_TZ).timestamp(),
@@ -236,7 +246,7 @@ class TestCostStatistic:
         ]
         fetched = [_reading(date(2026, 10, 1), 0, 50)]
 
-        add = await self._run(sensor, None, history, fetched)
+        add = await self._run(coordinator, None, history, fetched)
 
         metadata, rows = add.call_args.args[1], add.call_args.args[2]
         assert metadata["statistic_id"] == COST_STATISTIC_ID
@@ -244,13 +254,13 @@ class TestCostStatistic:
         assert [row["sum"] for row in rows] == [0.2, 0.3]
 
     async def test_later_writes_price_only_new_readings(self) -> None:
-        sensor = _make_sensor(_tariff())
+        coordinator = _make_coordinator(_tariff())
         fetched = [
             _reading(date(2026, 10, 1), 0, 100),
             _reading(date(2026, 10, 1), 1, 100),
         ]
 
-        add = await self._run(sensor, 0.2, [], fetched)
+        add = await self._run(coordinator, 0.2, [], fetched)
 
         rows = add.call_args.args[2]
         assert [row["start"].hour for row in rows] == [1]
@@ -259,7 +269,7 @@ class TestCostStatistic:
     async def test_recorded_readings_never_priced_are_priced_with_the_new_ones(
         self,
     ) -> None:
-        sensor = _make_sensor(_tariff())
+        coordinator = _make_coordinator(_tariff())
         history = [
             {
                 "start": datetime(2026, 10, 1, hour, tzinfo=LONDON_TZ).timestamp(),
@@ -270,7 +280,7 @@ class TestCostStatistic:
         ]
         fetched = [_reading(date(2026, 10, 1), 2, 100)]
 
-        add = await self._run(sensor, 0.2, history, fetched)
+        add = await self._run(coordinator, 0.2, history, fetched)
 
         rows = add.call_args.args[2]
         assert [row["start"].astimezone(LONDON_TZ).hour for row in rows] == [1, 2]
@@ -279,7 +289,7 @@ class TestCostStatistic:
     async def test_a_recorded_reading_is_not_priced_again_as_a_fetched_one(
         self,
     ) -> None:
-        sensor = _make_sensor(_tariff())
+        coordinator = _make_coordinator(_tariff())
         history = [
             {
                 "start": datetime(2026, 10, 1, 1, tzinfo=LONDON_TZ).timestamp(),
@@ -289,14 +299,16 @@ class TestCostStatistic:
         ]
         fetched = [_reading(date(2026, 10, 1), 1, 100)]
 
-        add = await self._run(sensor, 0.2, history, fetched)
+        add = await self._run(coordinator, 0.2, history, fetched)
 
         assert [row["sum"] for row in add.call_args.args[2]] == [0.4]
 
     async def test_nothing_is_written_without_a_tariff(self) -> None:
-        sensor = _make_sensor(None)
+        coordinator = _make_coordinator(None)
 
-        add = await self._run(sensor, None, [], [_reading(date(2026, 10, 1), 0, 50)])
+        add = await self._run(
+            coordinator, None, [], [_reading(date(2026, 10, 1), 0, 50)]
+        )
 
         add.assert_not_called()
 
@@ -304,7 +316,7 @@ class TestCostStatistic:
 class TestUpdateWritesCost:
     async def test_a_refresh_prices_what_it_fetched(self) -> None:
         """Each refresh passes its new readings on to the cost statistic."""
-        sensor = _make_sensor(_tariff())
+        coordinator = _make_coordinator(_tariff())
 
         def fake_fetch(start, end, granularity="H"):
             return _make_meter_usage(
@@ -313,14 +325,16 @@ class TestUpdateWritesCost:
 
         with (
             _recorder(None, []),
-            patch.object(sensor, "_async_start_day", return_value=date(2026, 10, 25)),
-            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
-            patch.object(sensor, "_inject_statistics"),
+            patch.object(
+                coordinator, "_async_start_day", return_value=date(2026, 10, 25)
+            ),
+            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_inject_statistics"),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
             ) as add,
         ):
-            await sensor.async_update()
+            await coordinator._async_update_data()
 
         assert add.call_args.args[1]["statistic_id"] == COST_STATISTIC_ID
         assert [row["sum"] for row in add.call_args.args[2]] == [0.2, 0.3]
@@ -348,17 +362,12 @@ class _FakeHass:
         return func(*args)
 
 
-def _make_sensor(tariff: Tariff | None = None) -> ThamesWaterSensor:
-    return ThamesWaterSensor(
-        hass=_FakeHass(),
-        tariff_coordinator=MagicMock(data=tariff),
-        name="Test",
-        username="u",
-        password="p",
-        account_number="1",
-        meter_id="m",
-        unique_id="uid",
+def _make_coordinator(tariff: Tariff | None = None) -> ThamesWaterCoordinator:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"username": "u", "password": "p", "account_number": "1", "meter_id": "m"},
     )
+    return ThamesWaterCoordinator(_FakeHass(), entry, MagicMock(data=tariff))
 
 
 @contextmanager
@@ -397,7 +406,7 @@ def no_statistics_yet():
 class TestUpdate:
     async def test_only_hourly_usage_is_fetched(self) -> None:
         """Each cycle makes a single hourly request and no daily one."""
-        sensor = _make_sensor()
+        coordinator = _make_coordinator()
         calls: list[str] = []
 
         def fake_fetch(start, end, granularity="H"):
@@ -405,10 +414,10 @@ class TestUpdate:
             return _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
 
         with (
-            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
-            patch.object(sensor, "_inject_statistics") as inject,
+            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_inject_statistics") as inject,
         ):
-            await sensor.async_update()
+            await coordinator._async_update_data()
 
         assert calls == ["H"]
         assert [call.args[0] for call in inject.call_args_list] == [
@@ -418,7 +427,7 @@ class TestUpdate:
 
     async def test_last_reading_time_tracks_latest_hourly_line(self) -> None:
         """The last_reading_time attribute reflects the real hour of the latest reading."""
-        sensor = _make_sensor()
+        coordinator = _make_coordinator()
         captured: dict[str, date] = {}
 
         def fake_fetch(start, end, granularity="H"):
@@ -432,12 +441,14 @@ class TestUpdate:
             )
 
         with (
-            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
-            patch.object(sensor, "_inject_statistics"),
+            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_inject_statistics"),
         ):
-            await sensor.async_update()
+            coordinator.data = await coordinator._async_update_data()
 
         expected_day = captured["start"]
+        sensor = ThamesWaterSensor(coordinator, "Test", "uid")
+        assert sensor.state == 105.0
         assert sensor.extra_state_attributes == {
             "last_reading_time": datetime(
                 expected_day.year,
@@ -449,10 +460,27 @@ class TestUpdate:
             ).isoformat(),
         }
 
+    async def test_a_refresh_with_nothing_new_keeps_the_last_reading(self) -> None:
+        coordinator = _make_coordinator()
+        usage = [
+            _make_meter_usage([_make_line(1.0, 100.0, "0:00")]),
+            _make_meter_usage([]),
+            RuntimeError("Thames Water is down"),
+        ]
+
+        with (
+            patch.object(coordinator, "_fetch_meter_usage", side_effect=usage),
+            patch.object(coordinator, "_inject_statistics"),
+        ):
+            first = coordinator.data = await coordinator._async_update_data()
+            assert first.latest_read == 100.0
+            assert await coordinator._async_update_data() == first
+            assert await coordinator._async_update_data() == first
+
 
 class TestResume:
     async def _fetch_window(self, newest: datetime | None) -> dict[str, date]:
-        sensor = _make_sensor()
+        coordinator = _make_coordinator()
         captured: dict[str, date] = {}
 
         def fake_fetch(start, end, granularity="H"):
@@ -461,10 +489,10 @@ class TestResume:
 
         with (
             _recorder_with_newest(newest),
-            patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
-            patch.object(sensor, "_inject_statistics"),
+            patch.object(coordinator, "_fetch_meter_usage", side_effect=fake_fetch),
+            patch.object(coordinator, "_inject_statistics"),
         ):
-            await sensor.async_update()
+            await coordinator._async_update_data()
         return captured
 
     async def test_starts_on_the_day_after_the_newest_statistic_and_ends_today(
@@ -489,19 +517,81 @@ class TestResume:
         assert window["start"] == (datetime.now(LONDON_TZ).date() - INITIAL_HISTORY)
 
     async def test_statistics_are_dated_from_the_day_resumed_from(self) -> None:
-        sensor = _make_sensor()
+        coordinator = _make_coordinator()
         usage = _make_meter_usage(
             [_make_line(1.0, 100.0, "0:00"), _make_line(2.0, 102.0, "1:00")]
         )
         with (
             _recorder_with_newest(datetime(2026, 10, 20, 5, tzinfo=LONDON_TZ)),
-            patch.object(sensor, "_fetch_meter_usage", return_value=usage),
-            patch.object(sensor, "_inject_statistics") as inject,
+            patch.object(coordinator, "_fetch_meter_usage", return_value=usage),
+            patch.object(coordinator, "_inject_statistics") as inject,
         ):
-            await sensor.async_update()
+            await coordinator._async_update_data()
 
         stats = inject.call_args_list[0].args[2]
         assert [row["start"] for row in stats] == [
             datetime(2026, 10, 21, 0, tzinfo=LONDON_TZ),
             datetime(2026, 10, 21, 1, tzinfo=LONDON_TZ),
         ]
+
+
+SENSOR = "custom_components.thames_water.sensor"
+ENTRY_DATA = {
+    "username": "someone@example.com",
+    "password": "hunter2",
+    "account_number": "900088966994",
+    "meter_id": "314287270",
+}
+
+
+@pytest.fixture
+def client() -> Generator[MagicMock]:
+    """A Thames Water that answers with one reading, for setting an entry up."""
+    client = MagicMock()
+    client.get_meter_usage.return_value = _make_meter_usage(
+        [_make_line(10.0, 66289.0, "23:00")]
+    )
+    with (
+        _recorder(None, []),
+        patch("homeassistant.components.recorder.async_setup", return_value=True),
+        patch(f"{SENSOR}.async_add_external_statistics"),
+        patch(f"{SENSOR}.get_tariff", return_value=_tariff()),
+        patch(f"{SENSOR}.ThamesWater", return_value=client),
+    ):
+        yield client
+
+
+async def _setup(hass: HomeAssistant) -> MockConfigEntry:
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    return entry
+
+
+class TestSetup:
+    async def test_the_consumption_sensor_shows_the_latest_reading(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        await _setup(hass)
+
+        assert hass.states.get("sensor.thames_water_sensor").state == "66289.0"
+
+    async def test_statistics_are_still_fetched_with_the_sensor_disabled(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        er.async_get(hass).async_get_or_create(
+            "sensor",
+            DOMAIN,
+            f"water_usage_{ENTRY_DATA['meter_id']}",
+            disabled_by=er.RegistryEntryDisabler.USER,
+        )
+        await _setup(hass)
+        assert client.get_meter_usage.call_count == 1
+
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + timedelta(hours=DEFAULT_UPDATE_INTERVAL_HOURS)
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert client.get_meter_usage.call_count == 2
