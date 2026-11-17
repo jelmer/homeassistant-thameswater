@@ -68,7 +68,31 @@ class TestGenerateHourlyStatistics:
         assert len(stats) == 1
         assert stats[0]["start"] == datetime(2024, 1, 1, 0, 0, tzinfo=LONDON_TZ)
         assert stats[0]["state"] == 10
-        assert stats[0]["sum"] == 100
+        assert stats[0]["sum"] == 10
+
+    def test_sum_counts_usage_rather_than_the_meter_register(self) -> None:
+        meter_usage = _make_meter_usage(
+            [
+                _make_line(10.0, 1_117_400.0, "0:00"),
+                _make_line(20.0, 1_117_420.0, "1:00"),
+            ]
+        )
+        stats = _generate_hourly_statistics_from_meter_usage(
+            date(2024, 1, 1), meter_usage
+        )
+        assert [stat["sum"] for stat in stats] == [10, 30]
+
+    def test_sum_continues_from_the_running_total(self) -> None:
+        meter_usage = _make_meter_usage(
+            [
+                _make_line(10.0, 1_117_400.0, "0:00"),
+                _make_line(20.0, 1_117_420.0, "1:00"),
+            ]
+        )
+        stats = _generate_hourly_statistics_from_meter_usage(
+            date(2024, 1, 1), meter_usage, running_total=500.0
+        )
+        assert [stat["sum"] for stat in stats] == [510, 530]
 
     def test_multiple_lines(self) -> None:
         meter_usage = _make_meter_usage(
@@ -313,7 +337,11 @@ class TestUpdateWritesCost:
 
         with (
             _recorder(None, []),
-            patch.object(sensor, "_async_start_day", return_value=date(2026, 10, 25)),
+            patch.object(
+                sensor,
+                "_async_resume_point",
+                return_value=(date(2026, 10, 25), 0.0),
+            ),
             patch.object(sensor, "_fetch_meter_usage", side_effect=fake_fetch),
             patch.object(sensor, "_inject_statistics"),
             patch(
@@ -362,12 +390,12 @@ def _make_sensor(tariff: Tariff | None = None) -> ThamesWaterSensor:
 
 
 @contextmanager
-def _recorder_with_newest(newest: datetime | None):
+def _recorder_with_newest(newest: datetime | None, total: float | None = 0.0):
     """Patch the recorder lookup of the newest stored consumption statistic."""
     rows = (
         {}
         if newest is None
-        else {CONSUMPTION_STATISTIC_ID: [{"start": newest.timestamp()}]}
+        else {CONSUMPTION_STATISTIC_ID: [{"start": newest.timestamp(), "sum": total}]}
     )
     instance = MagicMock()
 
@@ -505,3 +533,41 @@ class TestResume:
             datetime(2026, 10, 21, 0, tzinfo=LONDON_TZ),
             datetime(2026, 10, 21, 1, tzinfo=LONDON_TZ),
         ]
+
+    async def _sums_after_update(self, newest: datetime | None, total=None):
+        sensor = _make_sensor()
+        usage = _make_meter_usage(
+            [
+                _make_line(1.0, 1_117_456.0, "0:00"),
+                _make_line(2.0, 1_117_458.0, "1:00"),
+            ]
+        )
+        with (
+            _recorder_with_newest(newest, total),
+            patch.object(sensor, "_fetch_meter_usage", return_value=usage),
+            patch.object(sensor, "_inject_statistics") as inject,
+        ):
+            await sensor.async_update()
+        return {
+            call.args[0]: [row["sum"] for row in call.args[2]]
+            for call in inject.call_args_list
+        }
+
+    async def test_first_setup_sums_start_from_zero(self) -> None:
+        sums = await self._sums_after_update(None)
+
+        assert sums[CONSUMPTION_STATISTIC_ID] == [1.0, 3.0]
+
+    async def test_new_days_carry_on_from_the_stored_total(self) -> None:
+        sums = await self._sums_after_update(
+            datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ), total=250.0
+        )
+
+        assert sums[CONSUMPTION_STATISTIC_ID] == [251.0, 253.0]
+
+    async def test_installs_that_stored_the_register_carry_on_from_it(self) -> None:
+        sums = await self._sums_after_update(
+            datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ), total=1_117_455.0
+        )
+
+        assert sums[CONSUMPTION_STATISTIC_ID] == [1_117_456.0, 1_117_458.0]

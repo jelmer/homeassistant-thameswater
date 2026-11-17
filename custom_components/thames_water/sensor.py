@@ -144,17 +144,20 @@ def get_unique_id(meter_id: str) -> str:
 
 
 def _generate_hourly_statistics_from_meter_usage(
-    start: date, meter_usage: MeterUsage
+    start: date, meter_usage: MeterUsage, running_total: float = 0.0
 ) -> list[StatisticData]:
     """Convert hourly meter usage lines into StatisticData entries."""
-    return [
-        StatisticData(
-            start=measurement.hour_start,
-            state=measurement.usage,
-            sum=measurement.total,
+    stats = []
+    for measurement in meter_usage_lines_to_timeseries(start, meter_usage.Lines):
+        running_total += measurement.usage
+        stats.append(
+            StatisticData(
+                start=measurement.hour_start,
+                state=measurement.usage,
+                sum=running_total,
+            )
         )
-        for measurement in meter_usage_lines_to_timeseries(start, meter_usage.Lines)
-    ]
+    return stats
 
 
 def _price_readings(
@@ -320,24 +323,32 @@ class ThamesWaterSensor(SensorEntity):
         )
         async_add_external_statistics(self._hass, metadata, stats)
 
-    async def _async_start_day(self) -> date:
-        """Return the day to resume fetching from.
+    async def _async_resume_point(self) -> tuple[date, float]:
+        """Return the day to resume fetching from, and the total to carry on from.
 
         Thames Water publishes whole days, so this is the day after the newest
         stored statistic, or a short look-back on first setup.
         """
         last = await get_instance(self._hass).async_add_executor_job(
-            get_last_statistics, self._hass, 1, CONSUMPTION_STATISTIC_ID, False, set()
+            get_last_statistics,
+            self._hass,
+            1,
+            CONSUMPTION_STATISTIC_ID,
+            False,
+            {"sum"},
         )
         rows = last.get(CONSUMPTION_STATISTIC_ID)
         if not rows:
-            return datetime.now(LONDON_TZ).date() - INITIAL_HISTORY
+            return datetime.now(LONDON_TZ).date() - INITIAL_HISTORY, 0.0
         newest = dt_util.utc_from_timestamp(rows[0]["start"])
-        return newest.astimezone(LONDON_TZ).date() + timedelta(days=1)
+        return (
+            newest.astimezone(LONDON_TZ).date() + timedelta(days=1),
+            rows[0]["sum"],
+        )
 
     async def async_update(self):
         """Fetch data, build statistics, and inject external statistics."""
-        start = await self._async_start_day()
+        start, running_total = await self._async_resume_point()
         end = datetime.now(LONDON_TZ).date()
 
         try:
@@ -352,7 +363,7 @@ class ThamesWaterSensor(SensorEntity):
         if hourly_usage is not None and len(hourly_usage.Lines) > 0:
             _LOGGER.info("Fetched %d hourly entries", len(hourly_usage.Lines))
             hourly_stats = _generate_hourly_statistics_from_meter_usage(
-                start, hourly_usage
+                start, hourly_usage, running_total
             )
             self._state = hourly_usage.Lines[-1].Read
             self._latest_reading_time = hourly_stats[-1]["start"]
