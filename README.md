@@ -64,7 +64,7 @@ Then, add the integration:
 
 The water statistics can be integrated into HA [Home Energy Management](https://www.home-assistant.io/docs/energy/) using **thames_water:thameswater_consumption**.
 
-It will attempt to fetch the latest data at 00:00 and 12:00 every day.
+It refreshes every 12 hours. To refresh on a different schedule, turn off *Enable polling for updates* in the integration's system options and call `homeassistant.update_entity` from an automation.
 
 Each refresh resumes from the last stored reading, so late or missed days get filled in. On first setup it starts six days back, which given the delay above yields about three days of readings.
 

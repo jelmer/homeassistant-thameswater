@@ -7,7 +7,7 @@ from thameswaterapi import AuthenticationError, ThamesWater
 
 from homeassistant import config_entries
 
-from .const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -118,7 +118,6 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data={
                     **self._credentials,
                     "meter_id": user_input["meter_id"],
-                    "update_interval_hours": user_input["update_interval_hours"],
                 },
             )
 
@@ -136,10 +135,6 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema(
             {
                 vol.Required("meter_id"): vol.In(meter_numbers),
-                vol.Required(
-                    "update_interval_hours",
-                    default=DEFAULT_UPDATE_INTERVAL_HOURS,
-                ): vol.All(int, vol.Range(min=1)),
             }
         )
 

@@ -20,11 +20,12 @@ from pytest_homeassistant_custom_component.common import (
 )
 from thameswaterapi import Account, AuthenticationError, Line, MeterUsage, Tariff
 
-from custom_components.thames_water.const import DEFAULT_UPDATE_INTERVAL_HOURS, DOMAIN
+from custom_components.thames_water.const import DOMAIN
 from custom_components.thames_water.sensor import (
     CONSUMPTION_STATISTIC_ID,
     COST_STATISTIC_ID,
     INITIAL_HISTORY,
+    UPDATE_INTERVAL,
     ThamesWaterCoordinator,
     ThamesWaterSensor,
     _generate_hourly_statistics_from_meter_usage,
@@ -431,6 +432,28 @@ def no_statistics_yet():
         yield
 
 
+def test_a_stored_interval_from_an_older_version_is_ignored(
+    hass: HomeAssistant,
+) -> None:
+    """Entries created while the interval was an option keep working unchanged."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "username": "u",
+            "password": "p",
+            "account_number": "1",
+            "meter_id": "m",
+            "update_interval_hours": 1,
+        },
+    )
+    entry.add_to_hass(hass)
+
+    assert (
+        ThamesWaterCoordinator(hass, entry, MagicMock()).update_interval
+        == UPDATE_INTERVAL
+    )
+
+
 class TestUpdate:
     async def test_only_hourly_usage_is_fetched(self) -> None:
         """Each cycle makes a single hourly request and no daily one."""
@@ -678,7 +701,7 @@ class TestSetup:
         await _setup(hass)
         client.get_account.side_effect = RuntimeError("no account today")
         async_fire_time_changed(
-            hass, dt_util.utcnow() + timedelta(hours=DEFAULT_UPDATE_INTERVAL_HOURS)
+            hass, dt_util.utcnow() + UPDATE_INTERVAL
         )
         await hass.async_block_till_done(wait_background_tasks=True)
 
@@ -708,7 +731,7 @@ class TestSetup:
         assert client.get_meter_usage.call_count == 1
 
         async_fire_time_changed(
-            hass, dt_util.utcnow() + timedelta(hours=DEFAULT_UPDATE_INTERVAL_HOURS)
+            hass, dt_util.utcnow() + UPDATE_INTERVAL
         )
         await hass.async_block_till_done(wait_background_tasks=True)
 
