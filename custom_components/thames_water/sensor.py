@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import logging
 from zoneinfo import ZoneInfo
 
@@ -325,8 +325,8 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
     async def _async_resume_point(self) -> tuple[date, float]:
         """Return the day to resume fetching from, and the total to carry on from.
 
-        Thames Water publishes whole days, so this is the day after the newest
-        stored statistic, or a short look-back on first setup.
+        Thames Water publishes a day's hours in pieces, so this goes back to the
+        day before the newest stored day, or a short look-back on first setup.
         """
         last = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics,
@@ -339,11 +339,14 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         rows = last.get(CONSUMPTION_STATISTIC_ID)
         if not rows:
             return datetime.now(LONDON_TZ).date() - INITIAL_HISTORY, 0.0
-        newest = dt_util.utc_from_timestamp(rows[0]["start"])
-        return (
-            newest.astimezone(LONDON_TZ).date() + timedelta(days=1),
-            rows[0]["sum"],
-        )
+        newest = dt_util.utc_from_timestamp(rows[0]["start"]).astimezone(LONDON_TZ)
+        since = datetime.combine(newest.date() - timedelta(days=1), time.min, LONDON_TZ)
+        stored = await self._async_stored_statistics(CONSUMPTION_STATISTIC_ID, since)
+        first = stored[0]
+        day = first["start"].astimezone(LONDON_TZ).date()
+        # No hours of that day are stored before `first`, so sum - state is the
+        # total at the end of the day before.
+        return day, first["sum"] - first["state"]
 
     async def _async_update_data(self) -> ThamesWaterData:
         """Fetch data, build statistics, and inject external statistics."""
@@ -395,12 +398,19 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             _LOGGER.debug("No tariff available yet, so nothing was priced")
             return
 
-        priced_through, running_total = await self._async_cost_watermark()
+        priced_through, running_total = await self._async_cost_watermark(
+            max(
+                consumption[0]["start"],
+                datetime.combine(tariff.effective_date, time.min, LONDON_TZ),
+            )
+        )
         # Readings recorded but never priced are priced too, such as those from
         # before the tariff was available.
         unpriced = [
             row
-            for row in await self._async_stored_consumption(priced_through)
+            for row in await self._async_stored_statistics(
+                CONSUMPTION_STATISTIC_ID, priced_through
+            )
             if row["start"] < consumption[0]["start"]
         ]
 
@@ -430,8 +440,15 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             rows,
         )
 
-    async def _async_cost_watermark(self) -> tuple[datetime | None, float]:
-        """Return how far cost has been priced, and the total to carry on from."""
+    async def _async_cost_watermark(
+        self, since: datetime
+    ) -> tuple[datetime | None, float]:
+        """Return how far cost is priced before the given hour, and the total there."""
+        priced = await self._async_stored_statistics(COST_STATISTIC_ID, since)
+        if priced:
+            # Hours before the first priced one added nothing to the sum, so
+            # sum - state is the total at `since - 1h`.
+            return since - timedelta(hours=1), priced[0]["sum"] - priced[0]["state"]
         last = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, COST_STATISTIC_ID, True, {"sum"}
         )
@@ -440,16 +457,16 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             return None, 0.0
         return dt_util.utc_from_timestamp(rows[0]["start"]), rows[0].get("sum") or 0.0
 
-    async def _async_stored_consumption(
-        self, since: datetime | None
+    async def _async_stored_statistics(
+        self, statistic_id: str, since: datetime | None
     ) -> list[StatisticData]:
-        """Return the consumption readings on record from the given hour on."""
+        """Return the statistic's rows on record from the given hour on."""
         history = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             since or dt_util.utc_from_timestamp(0),
             None,
-            {CONSUMPTION_STATISTIC_ID},
+            {statistic_id},
             "hour",
             None,
             {"state", "sum"},
@@ -460,7 +477,7 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
                 state=row["state"],
                 sum=row["sum"],
             )
-            for row in history.get(CONSUMPTION_STATISTIC_ID, [])
+            for row in history.get(statistic_id, [])
         ]
 
 

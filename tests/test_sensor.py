@@ -216,8 +216,29 @@ class TestPriceReadings:
         assert [row["start"].date() for row in rows] == [date(2027, 3, 31)]
 
 
+def _stored(rows: dict[str, list[dict]]):
+    """Stand in for statistics_during_period, returning rows from the given hour."""
+
+    def during(hass, start, end, statistic_ids, period, units, types):
+        return {
+            statistic_id: [
+                row
+                for row in rows.get(statistic_id, [])
+                if row["start"] >= start.timestamp()
+            ]
+            for statistic_id in statistic_ids
+        }
+
+    return during
+
+
 @contextmanager
-def _recorder(newest_cost: float | None, history: list[dict]):
+def _recorder(
+    newest_cost: float | None,
+    history: list[dict],
+    priced: list[dict] | None = None,
+    newest_cost_at: datetime = datetime(2026, 10, 1, 0, tzinfo=LONDON_TZ),
+):
     instance = MagicMock()
 
     async def run(func, *args):
@@ -229,10 +250,7 @@ def _recorder(newest_cost: float | None, history: list[dict]):
     else:
         last = {
             COST_STATISTIC_ID: [
-                {
-                    "start": datetime(2026, 10, 1, 0, tzinfo=LONDON_TZ).timestamp(),
-                    "sum": newest_cost,
-                }
+                {"start": newest_cost_at.timestamp(), "sum": newest_cost}
             ]
         }
     with (
@@ -245,16 +263,18 @@ def _recorder(newest_cost: float | None, history: list[dict]):
         ),
         patch(
             "custom_components.thames_water.sensor.statistics_during_period",
-            return_value={CONSUMPTION_STATISTIC_ID: history},
+            side_effect=_stored(
+                {CONSUMPTION_STATISTIC_ID: history, COST_STATISTIC_ID: priced or []}
+            ),
         ),
     ):
         yield
 
 
 class TestCostStatistic:
-    async def _run(self, coordinator, newest_cost, history, fetched):
+    async def _run(self, coordinator, newest_cost, history, fetched, **stored):
         with (
-            _recorder(newest_cost, history),
+            _recorder(newest_cost, history, **stored),
             patch(
                 "custom_components.thames_water.sensor.async_add_external_statistics"
             ) as add,
@@ -330,6 +350,41 @@ class TestCostStatistic:
 
         assert [row["sum"] for row in add.call_args.args[2]] == [0.4]
 
+    async def test_readings_fetched_again_are_priced_again(self) -> None:
+        coordinator = _make_coordinator(_tariff())
+        priced = [
+            {
+                "start": datetime(2026, 10, 1, 0, tzinfo=LONDON_TZ).timestamp(),
+                "state": 0.1,
+                "sum": 5.1,
+            }
+        ]
+        fetched = [
+            _reading(date(2026, 10, 1), 0, 100),
+            _reading(date(2026, 10, 1), 1, 100),
+        ]
+
+        add = await self._run(coordinator, None, [], fetched, priced=priced)
+
+        assert [row["sum"] for row in add.call_args.args[2]] == [5.2, 5.4]
+
+    async def test_a_new_charging_year_carries_on_from_the_last_one(self) -> None:
+        coordinator = _make_coordinator(_tariff(effective=date(2026, 10, 1)))
+        last_hour = datetime(2026, 9, 30, 23, tzinfo=LONDON_TZ)
+        priced = [{"start": last_hour.timestamp(), "state": 0.3, "sum": 14.8}]
+        fetched = [
+            _reading(date(2026, 9, 30), 23, 100),
+            _reading(date(2026, 10, 1), 0, 100),
+        ]
+
+        add = await self._run(
+            coordinator, 14.8, [], fetched, priced=priced, newest_cost_at=last_hour
+        )
+
+        rows = add.call_args.args[2]
+        assert [row["start"].day for row in rows] == [1]
+        assert rows[0]["sum"] == 15.0
+
     async def test_nothing_is_written_without_a_tariff(self) -> None:
         coordinator = _make_coordinator(None)
 
@@ -400,13 +455,26 @@ def _make_coordinator(tariff: Tariff | None = None) -> ThamesWaterCoordinator:
 
 
 @contextmanager
-def _recorder_with_newest(newest: datetime | None, total: float | None = 0.0):
-    """Patch the recorder lookup of the newest stored consumption statistic."""
+def _recorder_with_newest(
+    newest: datetime | None,
+    total: float | None = 0.0,
+    usage: float = 0.0,
+    earlier: list[dict] | None = None,
+):
+    """Patch the recorder lookups of the stored consumption statistic."""
     rows = (
         {}
         if newest is None
-        else {CONSUMPTION_STATISTIC_ID: [{"start": newest.timestamp(), "sum": total}]}
+        else {
+            CONSUMPTION_STATISTIC_ID: [
+                {"start": newest.timestamp(), "state": usage, "sum": total}
+            ]
+        }
     )
+    stored = {
+        CONSUMPTION_STATISTIC_ID: (earlier or [])
+        + rows.get(CONSUMPTION_STATISTIC_ID, [])
+    }
     instance = MagicMock()
 
     async def run(func, *args):
@@ -420,6 +488,10 @@ def _recorder_with_newest(newest: datetime | None, total: float | None = 0.0):
         patch(
             "custom_components.thames_water.sensor.get_last_statistics",
             return_value=rows,
+        ),
+        patch(
+            "custom_components.thames_water.sensor.statistics_during_period",
+            side_effect=_stored(stored),
         ),
     ):
         yield
@@ -528,7 +600,9 @@ class TestUpdate:
 
 
 class TestResume:
-    async def _fetch_window(self, newest: datetime | None) -> dict[str, date]:
+    async def _fetch_window(
+        self, newest: datetime | None, earlier: list[dict] | None = None
+    ) -> dict[str, date]:
         coordinator = _make_coordinator()
         captured: dict[str, date] = {}
 
@@ -537,20 +611,36 @@ class TestResume:
             return _make_meter_usage([_make_line(1.0, 1.0, "0:00")]), None
 
         with (
-            _recorder_with_newest(newest),
+            _recorder_with_newest(newest, earlier=earlier),
             patch.object(coordinator, "_fetch", side_effect=fake_fetch),
             patch.object(coordinator, "_inject_statistics"),
         ):
             await coordinator._async_update_data()
         return captured
 
-    async def test_starts_on_the_day_after_the_newest_statistic_and_ends_today(
+    async def test_starts_on_the_day_before_the_newest_statistic_and_ends_today(
+        self,
+    ) -> None:
+        earlier = [
+            {
+                "start": datetime(2026, 10, 19, 5, tzinfo=LONDON_TZ).timestamp(),
+                "state": 1.0,
+                "sum": 1.0,
+            }
+        ]
+        window = await self._fetch_window(
+            datetime(2026, 10, 20, 13, tzinfo=LONDON_TZ), earlier
+        )
+
+        assert window["start"] == date(2026, 10, 19)
+        assert window["end"] == datetime.now(LONDON_TZ).date()
+
+    async def test_starts_on_the_newest_day_if_the_day_before_has_nothing(
         self,
     ) -> None:
         window = await self._fetch_window(datetime(2026, 10, 20, 13, tzinfo=LONDON_TZ))
 
-        assert window["start"] == date(2026, 10, 21)
-        assert window["end"] == datetime.now(LONDON_TZ).date()
+        assert window["start"] == date(2026, 10, 20)
 
     async def test_a_statistic_just_after_local_midnight_is_that_london_day(
         self,
@@ -558,7 +648,7 @@ class TestResume:
         """00:00 BST is the previous day in UTC but the same day in London."""
         window = await self._fetch_window(datetime(2026, 7, 2, 0, tzinfo=LONDON_TZ))
 
-        assert window["start"] == date(2026, 7, 3)
+        assert window["start"] == date(2026, 7, 2)
 
     async def test_first_setup_looks_back_a_fixed_period(self) -> None:
         window = await self._fetch_window(None)
@@ -579,11 +669,13 @@ class TestResume:
 
         stats = inject.call_args_list[0].args[2]
         assert [row["start"] for row in stats] == [
-            datetime(2026, 10, 21, 0, tzinfo=LONDON_TZ),
-            datetime(2026, 10, 21, 1, tzinfo=LONDON_TZ),
+            datetime(2026, 10, 20, 0, tzinfo=LONDON_TZ),
+            datetime(2026, 10, 20, 1, tzinfo=LONDON_TZ),
         ]
 
-    async def _sums_after_update(self, newest: datetime | None, total=None):
+    async def _sums_after_update(
+        self, newest: datetime | None, total=None, earlier: list[dict] | None = None
+    ):
         coordinator = _make_coordinator()
         usage = _make_meter_usage(
             [
@@ -592,7 +684,7 @@ class TestResume:
             ]
         )
         with (
-            _recorder_with_newest(newest, total),
+            _recorder_with_newest(newest, total, earlier=earlier),
             patch.object(coordinator, "_fetch", return_value=(usage, None)),
             patch.object(coordinator, "_inject_statistics") as inject,
         ):
@@ -607,9 +699,18 @@ class TestResume:
 
         assert sums[CONSUMPTION_STATISTIC_ID] == [1.0, 3.0]
 
-    async def test_new_days_carry_on_from_the_stored_total(self) -> None:
+    async def test_carries_on_from_the_total_before_the_first_day_fetched(
+        self,
+    ) -> None:
+        earlier = [
+            {
+                "start": datetime(2026, 10, 19, 0, tzinfo=LONDON_TZ).timestamp(),
+                "state": 10.0,
+                "sum": 260.0,
+            }
+        ]
         sums = await self._sums_after_update(
-            datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ), total=250.0
+            datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ), total=300.0, earlier=earlier
         )
 
         assert sums[CONSUMPTION_STATISTIC_ID] == [251.0, 253.0]
