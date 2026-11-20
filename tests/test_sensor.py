@@ -442,6 +442,8 @@ class TestStillInForce:
 class _FakeHass:
     """Minimal stand-in for HomeAssistant that runs executor jobs inline."""
 
+    config_entries = MagicMock()
+
     async def async_add_executor_job(self, func, *args):
         return func(*args)
 
@@ -722,6 +724,75 @@ class TestResume:
 
         assert sums[CONSUMPTION_STATISTIC_ID] == [1_117_456.0, 1_117_458.0]
 
+
+class TestImportChosenAtSetup:
+    async def _update(
+        self,
+        import_from: date,
+        newest: datetime | None,
+        earlier: list[dict] | None = None,
+        newest_usage: float = 0.0,
+    ) -> tuple[date, list[float]]:
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                "username": "u",
+                "password": "p",
+                "account_number": "1",
+                "meter_id": "m",
+                "import_from": import_from.isoformat(),
+            },
+        )
+        coordinator = ThamesWaterCoordinator(_FakeHass(), entry, MagicMock(data=None))
+        usage = _make_meter_usage(
+            [_make_line(1.0, 100.0, "0:00"), _make_line(2.0, 102.0, "1:00")]
+        )
+        with (
+            _recorder_with_newest(newest, 300.0, newest_usage, earlier),
+            patch.object(coordinator, "_fetch", return_value=(usage, None)) as fetch,
+            patch.object(coordinator, "_inject_statistics") as inject,
+        ):
+            await coordinator._async_update_data()
+        sums = [row["sum"] for row in inject.call_args_list[1].args[2]]
+        return fetch.call_args.args[0], sums
+
+    async def test_starts_on_the_chosen_day_even_with_newer_statistics(self) -> None:
+        start, sums = await self._update(
+            date(2026, 1, 1),
+            datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ),
+            newest_usage=300.0,
+        )
+
+        assert start == date(2026, 1, 1)
+        assert sums == [1.0, 3.0]
+
+    async def test_carries_on_from_the_total_stored_before_the_chosen_day(
+        self,
+    ) -> None:
+        earlier = [
+            {
+                "start": datetime(2026, 3, 1, 0, tzinfo=LONDON_TZ).timestamp(),
+                "state": 10.0,
+                "sum": 260.0,
+            }
+        ]
+        start, sums = await self._update(
+            date(2026, 3, 1), datetime(2026, 10, 20, 23, tzinfo=LONDON_TZ), earlier
+        )
+
+        assert start == date(2026, 3, 1)
+        assert sums == [251.0, 253.0]
+
+    async def test_a_chosen_day_after_the_newest_statistic_leaves_no_gap(
+        self,
+    ) -> None:
+        start, sums = await self._update(
+            date(2026, 10, 20), datetime(2026, 10, 10, 23, tzinfo=LONDON_TZ)
+        )
+
+        assert start == date(2026, 10, 10)
+        assert sums == [301.0, 303.0]
+
 CONSUMPTION = "sensor.thames_water_sensor"
 BALANCE = "sensor.thames_water_outstanding_balance"
 ENTRY_DATA = {
@@ -816,6 +887,24 @@ class TestSetup:
 
         assert hass.states.get(CONSUMPTION).state == STATE_UNAVAILABLE
         assert hass.states.get(BALANCE).state == STATE_UNAVAILABLE
+
+    async def test_the_chosen_history_is_imported_once(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        entry = MockConfigEntry(
+            domain=DOMAIN, data={**ENTRY_DATA, "import_from": "2026-01-01"}
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert client.get_meter_usage.call_args.args[1] == date(2026, 1, 1)
+        assert "import_from" not in entry.data
+
+        async_fire_time_changed(hass, dt_util.utcnow() + UPDATE_INTERVAL)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert client.get_meter_usage.call_args.args[1] != date(2026, 1, 1)
 
     async def test_statistics_are_still_fetched_with_the_sensors_disabled(
         self, hass: HomeAssistant, client: MagicMock

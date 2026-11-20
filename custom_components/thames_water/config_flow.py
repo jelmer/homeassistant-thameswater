@@ -1,5 +1,6 @@
 """Config flow for Thames Water integration."""
 
+from datetime import datetime, timedelta
 import logging
 
 import voluptuous as vol
@@ -8,6 +9,7 @@ from thameswaterapi import AuthenticationError, ThamesWater
 from homeassistant import config_entries
 
 from .const import DOMAIN
+from .sensor import INITIAL_HISTORY, LONDON_TZ
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -113,11 +115,15 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
+            import_from = datetime.now(LONDON_TZ).date() - timedelta(
+                days=user_input["history_days"]
+            )
             return self.async_create_entry(
                 title="Thames Water",
                 data={
                     **self._credentials,
                     "meter_id": user_input["meter_id"],
+                    "import_from": import_from.isoformat(),
                 },
             )
 
@@ -135,6 +141,9 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema(
             {
                 vol.Required("meter_id"): vol.In(meter_numbers),
+                vol.Required("history_days", default=INITIAL_HISTORY.days): vol.All(
+                    vol.Coerce(int), vol.Range(min=1)
+                ),
             }
         )
 

@@ -5,6 +5,11 @@
         "data": {
           "account_number": "Contract account"
         }
+      },
+      "meter": {
+        "data": {
+          "history_days": "Days of history to import"
+        }
       }
     },
     "error": {
