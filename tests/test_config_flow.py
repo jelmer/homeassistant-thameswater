@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from thameswaterapi import AuthenticationError
 
 from custom_components.thames_water.const import DOMAIN
+from custom_components.thames_water.sensor import LONDON_TZ
 
 CREDENTIALS = {"username": "someone@example.com", "password": "hunter2"}
 
@@ -202,10 +204,10 @@ async def test_the_meter_step_does_not_ask_for_a_refresh_interval(
     ):
         result = await hass.config_entries.flow.async_configure(flow_id, CREDENTIALS)
         assert result["step_id"] == "meter"
-        assert list(result["data_schema"].schema) == ["meter_id"]
+        assert list(result["data_schema"].schema) == ["meter_id", "history_days"]
 
         result = await hass.config_entries.flow.async_configure(
-            flow_id, {"meter_id": "meter-1"}
+            flow_id, {"meter_id": "meter-1", "history_days": 30}
         )
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
@@ -213,4 +215,7 @@ async def test_the_meter_step_does_not_ask_for_a_refresh_interval(
         **CREDENTIALS,
         "account_number": "12345678",
         "meter_id": "meter-1",
+        "import_from": (
+            datetime.now(LONDON_TZ).date() - timedelta(days=30)
+        ).isoformat(),
     }

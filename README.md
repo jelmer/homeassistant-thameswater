@@ -66,7 +66,7 @@ The water statistics can be integrated into HA [Home Energy Management](https://
 
 It refreshes every 12 hours. To refresh on a different schedule, turn off *Enable polling for updates* in the integration's system options and call `homeassistant.update_entity` from an automation.
 
-Each refresh resumes from the last stored reading, so late or missed days get filled in. On first setup it starts six days back, which given the delay above yields about three days of readings.
+Each refresh resumes from the last stored reading, so late or missed days get filled in. During setup you can choose how many days of history to import. To import more later, remove the integration and add it again.
 
 [![Open your Home Assistant instance and show your Energy configuration panel.](https://my.home-assistant.io/badges/config_energy.svg)](https://my.home-assistant.io/redirect/config_energy/)
 

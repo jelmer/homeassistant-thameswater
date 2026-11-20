@@ -351,6 +351,15 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
     async def _async_update_data(self) -> ThamesWaterData:
         """Fetch data, build statistics, and inject external statistics."""
         start, running_total = await self._async_resume_point()
+        # Right after setup, every reading from the day chosen there is written
+        # again, carrying on from the total stored before it.
+        chosen = self.config_entry.data.get("import_from")
+        if chosen is not None and (day := date.fromisoformat(chosen)) < start:
+            stored = await self._async_stored_statistics(
+                CONSUMPTION_STATISTIC_ID, datetime.combine(day, time.min, LONDON_TZ)
+            )
+            start = day
+            running_total = stored[0]["sum"] - stored[0]["state"] if stored else 0.0
         end = datetime.now(LONDON_TZ).date()
 
         try:
@@ -387,6 +396,13 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
                 hourly_stats,
             )
             await self._async_write_cost_statistics(hourly_stats)
+            # The chosen history is in, so later refreshes resume as usual.
+            if "import_from" in self.config_entry.data:
+                data_without = dict(self.config_entry.data)
+                del data_without["import_from"]
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry, data=data_without
+                )
         return data
 
     async def _async_write_cost_statistics(
