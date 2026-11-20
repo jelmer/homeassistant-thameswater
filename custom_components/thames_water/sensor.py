@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from thameswaterapi import (
     Account,
+    AuthenticationError,
     MeterUsage,
     Tariff,
     TariffError,
@@ -39,6 +40,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, UnitOfVolume
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -357,6 +359,10 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             hourly_usage, account = await self.hass.async_add_executor_job(
                 self._fetch, start, end
             )
+        except AuthenticationError as err:
+            raise ConfigEntryAuthFailed(
+                f"Thames Water rejected the password: {err}"
+            ) from err
         except Exception as err:
             raise UpdateFailed(f"Could not sign in to Thames Water: {err}") from err
 

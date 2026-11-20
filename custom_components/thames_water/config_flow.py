@@ -1,6 +1,8 @@
 """Config flow for Thames Water integration."""
 
+from collections.abc import Mapping
 import logging
+from typing import Any
 
 import voluptuous as vol
 from thameswaterapi import AuthenticationError, ThamesWater
@@ -140,6 +142,39 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="meter", data_schema=data_schema, errors=errors
+        )
+
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]):
+        """Ask for the password again after Thames Water rejected it."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None):
+        """Collect the new password, and keep it only once it signs in."""
+        entry = self._get_reauth_entry()
+        errors = {}
+        if user_input is not None:
+            try:
+                await self.hass.async_add_executor_job(
+                    self._authenticate,
+                    entry.data["username"],
+                    user_input["password"],
+                )
+            except AuthenticationError:
+                _LOGGER.exception("Thames Water rejected the sign-in")
+                errors["base"] = "invalid_auth"
+            except Exception:
+                _LOGGER.exception("Could not sign in to Thames Water")
+                errors["base"] = "cannot_connect"
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data_updates=user_input
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required("password"): str}),
+            description_placeholders={"username": entry.data["username"]},
+            errors=errors,
         )
 
     async def _fetch(self, call, description: str):
