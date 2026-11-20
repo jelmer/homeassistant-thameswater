@@ -120,6 +120,7 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data={
                     **self._credentials,
                     "meter_id": user_input["meter_id"],
+                    "refresh_token": self._client.refresh_token,
                 },
             )
 
@@ -154,7 +155,7 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
         if user_input is not None:
             try:
-                await self.hass.async_add_executor_job(
+                client = await self.hass.async_add_executor_job(
                     self._authenticate,
                     entry.data["username"],
                     user_input["password"],
@@ -167,7 +168,11 @@ class ThamesWaterConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             else:
                 return self.async_update_reload_and_abort(
-                    entry, data_updates=user_input
+                    entry,
+                    data_updates={
+                        **user_input,
+                        "refresh_token": client.refresh_token,
+                    },
                 )
 
         return self.async_show_form(

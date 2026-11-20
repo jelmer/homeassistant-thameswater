@@ -180,6 +180,8 @@ async def test_an_empty_meter_list_is_an_answer_not_a_failure(
 class _ReadyClient(_AccountClient):
     """A smart-metered account with one meter."""
 
+    refresh_token = "flow-token"
+
     def get_account(self) -> object:
         return SimpleNamespace(is_smart_metered=True)
 
@@ -214,6 +216,7 @@ async def test_the_meter_step_does_not_ask_for_a_refresh_interval(
         **CREDENTIALS,
         "account_number": "12345678",
         "meter_id": "meter-1",
+        "refresh_token": "flow-token",
     }
 
 
@@ -234,7 +237,10 @@ async def test_reauth_keeps_a_password_only_once_it_signs_in(
         patch(
             "custom_components.thames_water.config_flow."
             "ThamesWaterConfigFlow._authenticate",
-            side_effect=[AuthenticationError("wrong password"), None],
+            side_effect=[
+                AuthenticationError("wrong password"),
+                SimpleNamespace(refresh_token="reauth-token"),
+            ],
         ) as authenticate,
         patch("custom_components.thames_water.async_setup_entry", return_value=True),
     ):
@@ -252,3 +258,4 @@ async def test_reauth_keeps_a_password_only_once_it_signs_in(
     assert result["reason"] == "reauth_successful"
     assert authenticate.call_args.args == (CREDENTIALS["username"], "correct horse")
     assert entry.data["password"] == "correct horse"
+    assert entry.data["refresh_token"] == "reauth-token"
