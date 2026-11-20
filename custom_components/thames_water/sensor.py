@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from thameswaterapi import (
     Account,
+    AuthenticationError,
     MeterUsage,
     Tariff,
     TariffError,
@@ -39,6 +40,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, UnitOfVolume
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -268,6 +270,7 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         self._password = entry.data["password"]
         self._account_number = entry.data["account_number"]
         self._meter_id = entry.data["meter_id"]
+        self._refresh_token = entry.data.get("refresh_token")
 
     def _fetch(
         self, start: date, end: date
@@ -280,6 +283,7 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             email=self._username,
             password=self._password,
             account_number=int(self._account_number),
+            refresh_token=self._refresh_token,
         )
         thames_water.authenticate()
         try:
@@ -294,6 +298,9 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         except Exception:
             _LOGGER.exception("Failed to fetch account details from Thames Water")
             account = None
+        # Every token grant rotates the refresh token, including the one
+        # behind the account call, so it is read once the calls are done.
+        self._refresh_token = thames_water.refresh_token
         return hourly_usage, account
 
     def _inject_statistics(
@@ -357,8 +364,20 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             hourly_usage, account = await self.hass.async_add_executor_job(
                 self._fetch, start, end
             )
+        except AuthenticationError as err:
+            raise ConfigEntryAuthFailed(
+                f"Thames Water rejected the password: {err}"
+            ) from err
         except Exception as err:
             raise UpdateFailed(f"Could not sign in to Thames Water: {err}") from err
+
+        # The previous token is spent, so the rotated one is what lets the
+        # next refresh, or the next start, sign in without the password.
+        if self._refresh_token != self.config_entry.data.get("refresh_token"):
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, "refresh_token": self._refresh_token},
+            )
 
         # Most refreshes find nothing newer, and the last reading still stands.
         if account is None and self.data:

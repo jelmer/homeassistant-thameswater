@@ -442,6 +442,8 @@ class TestStillInForce:
 class _FakeHass:
     """Minimal stand-in for HomeAssistant that runs executor jobs inline."""
 
+    config_entries = MagicMock()
+
     async def async_add_executor_job(self, func, *args):
         return func(*args)
 
@@ -736,6 +738,7 @@ ENTRY_DATA = {
 def client() -> Generator[MagicMock]:
     """A Thames Water that answers with one reading, for setting an entry up."""
     client = MagicMock()
+    client.refresh_token = "rotated-token"
     client.get_meter_usage.return_value = _make_meter_usage(
         [_make_line(10.0, 66289.0, "23:00")]
     )
@@ -778,6 +781,26 @@ class TestSetup:
         assert balance.attributes["current_balance"] == -12.34
         assert balance.attributes["is_in_credit"] is False
 
+    async def test_each_sign_in_starts_from_the_last_rotated_token(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        entry = MockConfigEntry(
+            domain=DOMAIN, data={**ENTRY_DATA, "refresh_token": "stored-token"}
+        )
+        entry.add_to_hass(hass)
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert client.constructed.call_args.kwargs["refresh_token"] == "stored-token"
+        assert entry.data["refresh_token"] == "rotated-token"
+
+        client.refresh_token = "rotated-again"
+        async_fire_time_changed(hass, dt_util.utcnow() + UPDATE_INTERVAL)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert client.constructed.call_args.kwargs["refresh_token"] == "rotated-token"
+        assert entry.data["refresh_token"] == "rotated-again"
+
     async def test_a_failed_usage_fetch_keeps_the_balance(
         self, hass: HomeAssistant, client: MagicMock
     ) -> None:
@@ -816,6 +839,24 @@ class TestSetup:
 
         assert hass.states.get(CONSUMPTION).state == STATE_UNAVAILABLE
         assert hass.states.get(BALANCE).state == STATE_UNAVAILABLE
+
+    async def test_a_rejected_password_asks_for_a_new_one(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.authenticate.side_effect = AuthenticationError("wrong password")
+        entry = await _setup(hass)
+
+        flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+        assert flows[0]["context"]["entry_id"] == entry.entry_id
+
+    async def test_a_failure_to_reach_thames_water_does_not_ask_for_a_password(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.authenticate.side_effect = OSError("connection reset")
+        await _setup(hass)
+
+        assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
 
     async def test_statistics_are_still_fetched_with_the_sensors_disabled(
         self, hass: HomeAssistant, client: MagicMock
