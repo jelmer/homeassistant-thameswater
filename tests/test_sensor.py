@@ -537,18 +537,51 @@ class TestUpdate:
         usage = _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
 
         with (
-            patch(f"{SENSOR}.ThamesWater") as thames_water,
+            patch.object(coordinator, "_client") as client,
             patch.object(coordinator, "_inject_statistics") as inject,
         ):
-            thames_water.return_value.get_meter_usage.return_value = usage
+            client.get_meter_usage.return_value = usage
             await coordinator._async_update_data()
 
-        calls = thames_water.return_value.get_meter_usage.call_args_list
+        calls = client.get_meter_usage.call_args_list
         assert [call.kwargs["granularity"] for call in calls] == ["H"]
         assert [call.args[0] for call in inject.call_args_list] == [
             "thames_water:thameswater_consumption_hourly",
             "thames_water:thameswater_consumption",
         ]
+
+    async def test_overlapping_refreshes_fetch_one_at_a_time(self) -> None:
+        """The client is shared, so a requested refresh that overlaps a
+        scheduled one waits rather than using it from a second thread."""
+        coordinator = _make_coordinator()
+        usage = _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
+        release = asyncio.Event()
+        running = 0
+        most_at_once = 0
+
+        async def slow_executor_job(func, *args):
+            nonlocal running, most_at_once
+            running += 1
+            most_at_once = max(most_at_once, running)
+            await release.wait()
+            running -= 1
+            return func(*args)
+
+        coordinator.hass.async_add_executor_job = slow_executor_job
+        with (
+            patch.object(coordinator, "_fetch", return_value=(usage, None)),
+            patch.object(coordinator, "_inject_statistics"),
+        ):
+            refreshes = [
+                asyncio.ensure_future(coordinator._async_update_data())
+                for _ in range(2)
+            ]
+            for _ in range(10):
+                await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(*refreshes)
+
+        assert most_at_once == 1
 
     async def test_last_reading_time_tracks_latest_hourly_line(self) -> None:
         """The last_reading_time attribute reflects the real hour of the latest reading."""
@@ -850,6 +883,25 @@ class TestSetup:
         assert balance.state == "12.34"
         assert balance.attributes["current_balance"] == -12.34
         assert balance.attributes["is_in_credit"] is False
+
+    async def test_later_refreshes_sign_in_on_the_same_client(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        """The client keeps the refresh token, so later sign-ins can use it."""
+        await _setup(hass)
+        async_fire_time_changed(hass, dt_util.utcnow() + UPDATE_INTERVAL)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert client.constructed.call_count == 1
+        assert client.authenticate.call_count == 2
+
+    async def test_unloading_closes_the_session(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        entry = await _setup(hass)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+        client.s.close.assert_called_once_with()
 
     async def test_a_failed_usage_fetch_keeps_the_balance(
         self, hass: HomeAssistant, client: MagicMock
