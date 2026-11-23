@@ -10,6 +10,12 @@
         "data": {
           "history_days": "Days of history to import"
         }
+      },
+      "reauth_confirm": {
+        "description": "Thames Water rejected the password for {username}. Enter the current one.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {
@@ -21,7 +27,8 @@
     "abort": {
       "invalid_auth": "Thames Water rejected the session before an account could be selected.",
       "cannot_connect": "Could not reach Thames Water while loading the account. Check the Home Assistant log for details.",
-      "not_smart_metered": "This login has no smart-metered account, so there are no readings to fetch."
+      "not_smart_metered": "This login has no smart-metered account, so there are no readings to fetch.",
+      "reauth_successful": "Thames Water accepted the new password."
     }
   }
 }

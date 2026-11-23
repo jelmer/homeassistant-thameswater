@@ -906,6 +906,24 @@ class TestSetup:
 
         assert client.get_meter_usage.call_args.args[1] != date(2026, 1, 1)
 
+    async def test_a_rejected_password_asks_for_a_new_one(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.authenticate.side_effect = AuthenticationError("wrong password")
+        entry = await _setup(hass)
+
+        flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        assert [flow["context"]["source"] for flow in flows] == ["reauth"]
+        assert flows[0]["context"]["entry_id"] == entry.entry_id
+
+    async def test_a_failure_to_reach_thames_water_does_not_ask_for_a_password(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        client.authenticate.side_effect = OSError("connection reset")
+        await _setup(hass)
+
+        assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+
     async def test_statistics_are_still_fetched_with_the_sensors_disabled(
         self, hass: HomeAssistant, client: MagicMock
     ) -> None:
