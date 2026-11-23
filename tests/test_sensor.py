@@ -15,6 +15,7 @@ from homeassistant.components.recorder.models import StatisticData
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -978,3 +979,58 @@ class TestSetup:
         assert finished
         assert hass.states.get(CONSUMPTION).state == "66289.0"
         assert hass.states.get(BALANCE).state == "12.34"
+
+    async def test_updating_both_sensors_signs_in_once(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        """Targeting both coordinator entities coalesces into one refresh."""
+        assert await async_setup_component(hass, "homeassistant", {})
+        await _setup(hass)
+
+        await hass.services.async_call(
+            "homeassistant",
+            "update_entity",
+            {"entity_id": [CONSUMPTION, BALANCE]},
+            blocking=True,
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert client.authenticate.call_count == 2
+
+    async def test_update_entity_returns_without_waiting_for_thames_water(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        """Manual update_entity schedules the refresh instead of blocking on it."""
+        assert await async_setup_component(hass, "homeassistant", {})
+        await _setup(hass)
+        started = asyncio.Event()
+        release = threading.Event()
+        finished = False
+        usage = client.get_meter_usage.return_value
+
+        def blocked_usage(*args, **kwargs):
+            nonlocal finished
+            hass.loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            finished = True
+            return usage
+
+        client.get_meter_usage.side_effect = blocked_usage
+        try:
+            await hass.services.async_call(
+                "homeassistant",
+                "update_entity",
+                {"entity_id": [CONSUMPTION]},
+                blocking=True,
+            )
+            assert not finished
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert not finished
+        finally:
+            release.set()
+
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert finished
+        assert client.authenticate.call_count == 2
