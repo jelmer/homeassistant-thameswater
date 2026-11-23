@@ -90,14 +90,9 @@ async def async_setup_entry(
     name = entry.data.get(CONF_NAME, "Thames Water Sensor")
 
     # The tariff sensors scrape a public, region-wide page and need no
-    # credentials, so they run on their own coordinator. It refreshes before the
-    # consumption sensor's first update, which prices readings with it. A failure
-    # here must not break consumption/balance, so we refresh without raising
-    # ConfigEntryNotReady.
+    # credentials, so they run on their own coordinator.
     tariff_coordinator = ThamesWaterTariffCoordinator(hass)
-    await tariff_coordinator.async_refresh()
     coordinator = ThamesWaterCoordinator(hass, entry, tariff_coordinator)
-    await coordinator.async_refresh()
     # The refresh is what writes the statistics, and a coordinator only polls
     # while something listens to it, so listen here in case the sensors are
     # disabled.
@@ -109,6 +104,17 @@ async def async_setup_entry(
     async_add_entities(
         ThamesWaterTariffSensor(tariff_coordinator, description)
         for description in TARIFF_SENSORS
+    )
+
+    async def _async_initial_refresh() -> None:
+        # Refresh the tariff before the consumption sensor's first update so
+        # readings can be priced with it. A failure here must not break
+        # consumption/balance, so refresh without ConfigEntryNotReady.
+        await tariff_coordinator.async_refresh()
+        await coordinator.async_refresh()
+
+    entry.async_create_background_task(
+        hass, _async_initial_refresh(), "thames_water_initial_refresh"
     )
     return True
 
@@ -263,6 +269,7 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             name="Thames Water",
             update_interval=UPDATE_INTERVAL,
         )
+        self.data = ThamesWaterData()
         self._tariff_coordinator = tariff_coordinator
         self._username = entry.data["username"]
         self._password = entry.data["password"]
