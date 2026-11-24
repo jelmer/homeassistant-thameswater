@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -831,7 +833,7 @@ async def _setup(hass: HomeAssistant) -> MockConfigEntry:
     entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     return entry
 
 
@@ -896,7 +898,7 @@ class TestSetup:
         )
         entry.add_to_hass(hass)
         assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
+        await hass.async_block_till_done(wait_background_tasks=True)
 
         assert client.get_meter_usage.call_args.args[1] == date(2026, 1, 1)
         assert "import_from" not in entry.data
@@ -944,3 +946,35 @@ class TestSetup:
         await hass.async_block_till_done(wait_background_tasks=True)
 
         assert client.get_meter_usage.call_count == 2
+
+    async def test_setup_does_not_wait_for_the_first_refresh(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        """Setup registers the entities immediately and refreshes in the background."""
+        started = asyncio.Event()
+        release = threading.Event()
+        finished = False
+
+        def blocked_authenticate():
+            nonlocal finished
+            hass.loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            finished = True
+
+        client.authenticate.side_effect = blocked_authenticate
+        entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA)
+        entry.add_to_hass(hass)
+        try:
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            assert not finished
+            assert hass.states.get(CONSUMPTION).state == STATE_UNKNOWN
+            assert hass.states.get(BALANCE).state == STATE_UNKNOWN
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert not finished
+        finally:
+            release.set()
+
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert finished
+        assert hass.states.get(CONSUMPTION).state == "66289.0"
+        assert hass.states.get(BALANCE).state == "12.34"
