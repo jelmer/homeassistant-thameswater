@@ -8,6 +8,8 @@ from datetime import date, datetime, time, timedelta
 import logging
 from zoneinfo import ZoneInfo
 
+import thameswaterapi
+
 from thameswaterapi import (
     Account,
     AuthenticationError,
@@ -51,6 +53,19 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import DOMAIN
+
+# Thames Water now includes "continuousFlow" in each meter usage line.
+# thameswaterapi's Line dataclass does not yet define this API field.
+# This integration does not use it, so ignore it before Line is constructed.
+_thameswaterapi_line = thameswaterapi.Line
+
+
+def _line_compatibility(**line_data):
+    line_data.pop("continuousFlow", None)
+    return _thameswaterapi_line(**line_data)
+
+
+thameswaterapi.Line = _line_compatibility
 
 _LOGGER = logging.getLogger(__name__)
 SELENIUM_TIMEOUT = 60
