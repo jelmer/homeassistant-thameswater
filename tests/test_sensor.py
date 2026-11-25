@@ -7,7 +7,7 @@ import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -583,6 +583,72 @@ class TestUpdate:
 
         assert most_at_once == 1
 
+    async def test_cancelled_refresh_still_serializes_fetch_in_threads(self) -> None:
+        """Cancelling a refresh releases the asyncio lock while the worker thread
+        is still running; a second refresh must still wait at the thread lock."""
+        coordinator = _make_coordinator()
+        usage = _make_meter_usage([_make_line(1.0, 1.0, "0:00")])
+        coordinator.hass.async_add_executor_job = asyncio.to_thread
+        entered = threading.Event()
+        second_waiting = threading.Event()
+        release = threading.Event()
+        state_lock = threading.Lock()
+        running = 0
+        most_at_once = 0
+
+        real_lock = coordinator._thread_lock
+        acquires = 0
+
+        class _ObservableLock:
+            def __enter__(self) -> None:
+                nonlocal acquires
+                with state_lock:
+                    acquires += 1
+                    if acquires == 2:
+                        second_waiting.set()
+                real_lock.acquire()
+
+            def __exit__(self, *args: object) -> None:
+                real_lock.release()
+
+        coordinator._thread_lock = _ObservableLock()  # type: ignore[assignment]
+
+        def slow_authenticate() -> None:
+            nonlocal running, most_at_once
+            with state_lock:
+                running += 1
+                most_at_once = max(most_at_once, running)
+                first_call = not entered.is_set()
+                if first_call:
+                    entered.set()
+            if first_call:
+                assert release.wait(timeout=5)
+            with state_lock:
+                running -= 1
+
+        with (
+            patch.object(coordinator, "_client") as client,
+            patch.object(coordinator, "_inject_statistics"),
+        ):
+            client.authenticate.side_effect = slow_authenticate
+            client.get_meter_usage.return_value = usage
+            client.get_account.return_value = None
+
+            first = asyncio.create_task(coordinator._async_update_data())
+            assert await asyncio.to_thread(entered.wait, 5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            second = asyncio.create_task(coordinator._async_update_data())
+            assert await asyncio.to_thread(second_waiting.wait, 5)
+            assert most_at_once == 1
+            release.set()
+            await second
+
+        assert most_at_once == 1
+        assert client.authenticate.call_count == 2
+
     async def test_last_reading_time_tracks_latest_hourly_line(self) -> None:
         """The last_reading_time attribute reflects the real hour of the latest reading."""
         coordinator = _make_coordinator()
@@ -901,7 +967,35 @@ class TestSetup:
         entry = await _setup(hass)
         assert await hass.config_entries.async_unload(entry.entry_id)
 
-        client.s.close.assert_called_once_with()
+        client.close.assert_called_once_with()
+
+    async def test_unloading_during_in_flight_fetch_defers_close(
+        self, hass: HomeAssistant, client: MagicMock
+    ) -> None:
+        """Unloading while a fetch is running in an executor thread does not
+        close the client concurrently; the fetch closes it when it finishes."""
+        entry = await _setup(hass)
+        entered = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+
+        def blocking_authenticate() -> None:
+            entered.set()
+            assert release.wait(timeout=5)
+
+        client.authenticate.side_effect = blocking_authenticate
+        client.close.side_effect = closed.set
+
+        async_fire_time_changed(hass, dt_util.utcnow() + UPDATE_INTERVAL)
+        assert await hass.async_add_executor_job(entered.wait, 5)
+
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        client.close.assert_not_called()
+
+        release.set()
+        assert await hass.async_add_executor_job(closed.wait, 5)
+        client.close.assert_called_once_with()
+        assert client.mock_calls[-1] == call.close()
 
     async def test_a_failed_usage_fetch_keeps_the_balance(
         self, hass: HomeAssistant, client: MagicMock
