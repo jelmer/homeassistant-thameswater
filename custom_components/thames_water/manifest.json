@@ -16,7 +16,7 @@
 		"thameswaterapi"
 	],
 	"requirements": [
-		"thameswaterapi>=0.6.0"
+		"thameswaterapi>=0.7.1"
 	],
 	"version": "1.5.1"
 }

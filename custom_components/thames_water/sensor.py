@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 import logging
+import threading
 from zoneinfo import ZoneInfo
 
 from thameswaterapi import (
@@ -273,10 +275,35 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         )
         self.data = ThamesWaterData()
         self._tariff_coordinator = tariff_coordinator
-        self._username = entry.data["username"]
-        self._password = entry.data["password"]
-        self._account_number = entry.data["account_number"]
         self._meter_id = entry.data["meter_id"]
+        # One client for the life of the entry, so each refresh can sign in
+        # with the refresh token the previous one left instead of the password.
+        self._client = ThamesWater(
+            email=entry.data["username"],
+            password=entry.data["password"],
+            account_number=int(entry.data["account_number"]),
+        )
+        # A requested refresh can overlap a scheduled one, and the client
+        # must not be used from two threads at once. The asyncio lock avoids
+        # queuing a second executor job in the normal overlapping case; the
+        # threading lock enforces mutual exclusion even if a refresh task is
+        # cancelled while its executor thread is still running.
+        self._fetch_lock = asyncio.Lock()
+        self._thread_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._fetching = False
+        self._closed = False
+        entry.async_on_unload(self._close)
+
+    def _close(self) -> None:
+        """Close the client now, or let an in-flight fetch close it when done."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            should_close = not self._fetching
+        if should_close:
+            self._client.close()
 
     def _fetch(
         self, start: date, end: date
@@ -285,25 +312,36 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
 
         The two come from different APIs, so one failing does not cost the other.
         """
-        thames_water = ThamesWater(
-            email=self._username,
-            password=self._password,
-            account_number=int(self._account_number),
-        )
-        thames_water.authenticate()
-        try:
-            hourly_usage = thames_water.get_meter_usage(
-                self._meter_id, start, end, granularity="H"
-            )
-        except Exception:
-            _LOGGER.exception("Failed to fetch hourly meter usage from Thames Water")
-            hourly_usage = None
-        try:
-            account = thames_water.get_account()
-        except Exception:
-            _LOGGER.exception("Failed to fetch account details from Thames Water")
-            account = None
-        return hourly_usage, account
+        with self._thread_lock:
+            with self._close_lock:
+                if self._closed:
+                    return None, None
+                self._fetching = True
+            try:
+                self._client.authenticate()
+                try:
+                    hourly_usage = self._client.get_meter_usage(
+                        self._meter_id, start, end, granularity="H"
+                    )
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to fetch hourly meter usage from Thames Water"
+                    )
+                    hourly_usage = None
+                try:
+                    account = self._client.get_account()
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to fetch account details from Thames Water"
+                    )
+                    account = None
+                return hourly_usage, account
+            finally:
+                with self._close_lock:
+                    self._fetching = False
+                    should_close = self._closed
+                if should_close:
+                    self._client.close()
 
     def _inject_statistics(
         self,
@@ -372,9 +410,10 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
         end = datetime.now(LONDON_TZ).date()
 
         try:
-            hourly_usage, account = await self.hass.async_add_executor_job(
-                self._fetch, start, end
-            )
+            async with self._fetch_lock:
+                hourly_usage, account = await self.hass.async_add_executor_job(
+                    self._fetch, start, end
+                )
         except AuthenticationError as err:
             raise ConfigEntryAuthFailed(
                 f"Thames Water rejected the password: {err}"
