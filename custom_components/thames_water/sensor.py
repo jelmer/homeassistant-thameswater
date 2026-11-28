@@ -41,6 +41,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -270,6 +271,12 @@ class ThamesWaterCoordinator(DataUpdateCoordinator[ThamesWaterData]):
             config_entry=entry,
             name="Thames Water",
             update_interval=UPDATE_INTERVAL,
+            # Thames Water takes 5-30s to answer, so a manual update_entity
+            # call schedules the refresh rather than awaiting it inside
+            # Home Assistant's 10s slow-update timer.
+            request_refresh_debouncer=Debouncer(
+                hass, _LOGGER, cooldown=0, immediate=False
+            ),
         )
         self.data = ThamesWaterData()
         self._tariff_coordinator = tariff_coordinator

@@ -64,7 +64,7 @@ Then, add the integration:
 
 The water statistics can be integrated into HA [Home Energy Management](https://www.home-assistant.io/docs/energy/) using **thames_water:thameswater_consumption**.
 
-It refreshes every 12 hours. To refresh on a different schedule, turn off *Enable polling for updates* in the integration's system options and call `homeassistant.update_entity` from an automation.
+It refreshes every 12 hours. To refresh on a different schedule, turn off *Enable polling for updates* in the integration's system options and call `homeassistant.update_entity` from an automation. That service call returns as soon as the refresh is scheduled rather than after Thames Water responds; to react to new readings or balance changes, trigger on sensor state changes instead of reading the sensor in the same automation.
 
 Each refresh resumes from the last stored reading, so late or missed days get filled in. During setup you can choose how many days of history to import. To import more later, remove the integration and add it again.
 
